@@ -1,0 +1,47 @@
+[build-system]
+requires = ['setuptools>=68', 'wheel']
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = 'sshmirror'
+version = '0.1.0'
+description = 'SSH directory synchronization library and CLI'
+readme = 'README.md'
+requires-python = '>=3.11'
+license = 'MIT'
+authors = [
+    { name = 'FellowCode' },
+]
+keywords = ['ssh', 'sync', 'deployment', 'cli', 'remote-files', 'project-management']
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Intended Audience :: Developers',
+    'Operating System :: OS Independent',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Topic :: Software Development :: Version Control',
+    'Topic :: System :: Networking',
+    'Topic :: Utilities',
+]
+dependencies = [
+    'aiofiles',
+    'aioshutil',
+    'asyncssh',
+    'beartype',
+    'pydantic',
+    'PyYAML',
+    'questionary',
+    'rich',
+]
+
+[project.scripts]
+sshmirror = 'sshmirror.cli:main'
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ['sshmirror', 'sshmirror.*']

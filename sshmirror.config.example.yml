@@ -1,0 +1,25 @@
+host: '192.168.12.22'
+port: '50022'
+username: 'root'
+# Optional. If omitted together with password, asyncssh will try the user's default SSH keys / ssh-agent.
+# private_key: '~/.ssh/id_ed25519'
+# private_key_passphrase: 'KeyPassphrase'
+# password: 'password'
+localdir: '.'
+remotedir: '/app'
+author: fellowx
+# Optional. If set, the container will be restarted after sync if you want. This is useful when the remote directory is mounted as a volume in a container and you want to apply changes immediately.
+restart_container:
+  # Optional. If omitted, values from the main connection are reused.
+  # host: '192.168.12.22'
+  # port: '23322'
+  # user: user
+  # Same auth rules as the main connection. If omitted here, values from the main
+  # connection are reused, including the default user key fallback.
+  # private_key: '~/.ssh/id_ed25519'
+  # private_key_passphrase: 'KeyPassphrase'
+  # password: 'password'
+  sudo: true
+  # Optional. Needed only when sudo requires a password and SSH auth uses a key.
+  # sudo_password: 'password'
+  container_name: testcontainer
