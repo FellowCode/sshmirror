@@ -10,6 +10,8 @@ SSHMirror is both:
 
 It can also be used as a lightweight sync workflow for a shared project: multiple developers can make changes to the same remote-backed codebase and inspect differences before pulling or pushing updates.
 
+Internet access is not required for SSHMirror itself. It only needs network access to the target SSH host or Docker host you are synchronizing with.
+
 ## Why It Stands Out
 
 - Preview first. Inspect current file changes and version-to-version diffs before syncing. 🔍
