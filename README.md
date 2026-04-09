@@ -12,6 +12,26 @@ It can also be used as a lightweight sync workflow for a shared project: multipl
 
 Internet access is not required for SSHMirror itself. It only needs network access to the target SSH host or Docker host you are synchronizing with.
 
+When you run `sshmirror` without arguments, it opens an interactive menu.
+Depending on project state, the menu can include:
+
+- `Create sshmirror.config.yml`
+- `Create sshmirror.ignore.txt`
+- `Initialization`
+- `Pull & Push`
+- `Status`
+- `View current changes`
+- `View version changes`
+- `Pull only`
+- `Stash changes`
+- `Restore stashed changes`
+- `Force pull`
+- `Discard all local changes`
+- `Discard selected files`
+- `Downgrade remote version`
+- `Test connection`
+- `Exit`
+
 ## Why It Stands Out
 
 - Preview first. Inspect current file changes and version-to-version diffs before syncing. 🔍
