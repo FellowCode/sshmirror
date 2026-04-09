@@ -57,6 +57,61 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(mirror._create_version(FileMap()).message, 'update')
                 self.assertTrue((tmp_path / '.sshmirror' / 'versions').exists())
 
+    def test_invalid_config_requires_main_connection_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                with self.assertRaisesRegex(ValueError, "'host'"):
+                    SSHMirror(
+                        config=SSHMirrorConfig(
+                            host='',
+                            port=22,
+                            username='root',
+                            localdir='.',
+                            remotedir='/app',
+                        )
+                    )
+
+    def test_invalid_config_rejects_partial_restart_container_connection(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                with self.assertRaisesRegex(ValueError, 'host.*,.*port.*,.*username|host.*port.*username'):
+                    SSHMirror(
+                        config=SSHMirrorConfig(
+                            host='127.0.0.1',
+                            port=22,
+                            username='root',
+                            localdir='.',
+                            remotedir='/app',
+                            restart_container={
+                                'host': 'docker-host',
+                                'container_name': 'app',
+                            },
+                        )
+                    )
+
+    def test_invalid_config_rejects_deprecated_restart_container_user_field(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                with self.assertRaisesRegex(ValueError, "restart_container.user.*no longer supported"):
+                    SSHMirror(
+                        config=SSHMirrorConfig(
+                            host='127.0.0.1',
+                            port=22,
+                            username='root',
+                            localdir='.',
+                            remotedir='/app',
+                            restart_container={
+                                'host': 'docker-host',
+                                'port': 22,
+                                'user': 'root',
+                                'container_name': 'app',
+                            },
+                        )
+                    )
+
     def test_force_pull_without_callbacks_aborts_before_network(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -125,6 +180,32 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(restart_connect_kwargs['port'], 22)
                 self.assertEqual(restart_connect_kwargs['username'], 'root')
                 self.assertTrue(mirror._restart_container_uses_main_connection())
+
+    def test_restart_container_username_is_used_for_separate_host(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'host': '192.168.1.10',
+                            'port': 2222,
+                            'username': 'deploy',
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                restart_connect_kwargs = mirror._get_restart_container_connect_kwargs()
+
+                self.assertEqual(restart_connect_kwargs['host'], '192.168.1.10')
+                self.assertEqual(restart_connect_kwargs['port'], 2222)
+                self.assertEqual(restart_connect_kwargs['username'], 'deploy')
 
     def test_test_connection_skips_duplicate_docker_host_check(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

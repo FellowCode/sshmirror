@@ -151,6 +151,8 @@ class SSHMirror:
                 discard_files=discard_files,
             )
 
+        resolved_config = resolved_config.validate()
+
         self.callbacks = callbacks or SSHMirrorCallbacks()
         self.commands = resolved_config.commands
             
@@ -181,9 +183,6 @@ class SSHMirror:
         self.remote_version = None
         self.local_version = None
         
-        if watch and no_sync:
-            raise Exception('Only one of watch and no_sync parameters maybe used')
-
         self.configured_ignore_path = resolved_config.ignore
         self.ignore_file_path = None
 
@@ -820,7 +819,7 @@ class SSHMirror:
         return self._build_connect_kwargs(
             host=restart_container.get('host', self.host),
             port=int(restart_container.get('port', self.port)),
-            username=restart_container.get('user', self.username),
+            username=restart_container.get('username', self.username),
             auth_kwargs=self._get_restart_container_auth_kwargs(),
         )
 

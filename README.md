@@ -103,15 +103,15 @@ remotedir: '/app'
 author: your-name
 
 restart_container:
-   # Optional. If omitted, host/port/user are reused from the main SSH config.
+   # Optional. If omitted, host/port/username are reused from the main SSH config.
    # host: '192.168.12.22'
    # port: '23322'
-   # user: user
+   # username: user
   sudo: true
   container_name: testcontainer
 ```
 
-`restart_container` connects to the Docker host where the container is running. If `host`, `port`, or `user` are not specified there, SSHMirror uses the main connection values.
+`restart_container` connects to the Docker host where the container is running. If `host`, `port`, or `username` are not specified there, SSHMirror uses the main connection values.
 
 ## CLI Commands 🧰
 
