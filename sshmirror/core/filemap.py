@@ -9,7 +9,7 @@ import datetime
 import os
 import uuid
 import typing
-from .utils import check_path_is_ignored, parse_ignore_file
+from .utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from rich.console import Console
 
 console = Console()
@@ -278,7 +278,7 @@ class FileMap:
         return False
     
     def files_diff(self, other_filemap: 'FileMap') -> Difference:
-        ignore_list = parse_ignore_file(self.ignore_file_path)
+        ignore_list = compile_ignore_rules(parse_ignore_file(self.ignore_file_path))
         changed = []
         deleted = []
         created = []
@@ -300,16 +300,16 @@ class FileMap:
         return Difference(changed=changed, created=created, deleted=deleted)
     
     def dirs_diff(self, other_filemap: 'FileMap'):
-        ignore_list = parse_ignore_file(self.ignore_file_path)
+        ignore_list = compile_ignore_rules(parse_ignore_file(self.ignore_file_path))
         created_dirs = []
         deleted_dirs = []
         for directory in self.directories:
-            if check_path_is_ignored(directory, ignore_list):
+            if check_path_is_ignored(directory, ignore_list, is_dir=True):
                 continue
             if directory not in other_filemap.directories:
                 created_dirs.append(directory)
         for directory in other_filemap.directories:
-            if check_path_is_ignored(directory, ignore_list):
+            if check_path_is_ignored(directory, ignore_list, is_dir=True):
                 continue
             if directory not in self.directories:
                 deleted_dirs.append(directory)

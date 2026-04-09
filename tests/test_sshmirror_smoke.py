@@ -8,7 +8,7 @@ import unittest
 from asyncssh import SSHClientConnection
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
 from sshmirror.cli import _build_interactive_menu_items, _configure_interactive_args, _create_default_config, build_parser
@@ -16,7 +16,7 @@ from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
 from sshmirror.core.schemas import DiffDetail
-from sshmirror.core.utils import check_path_is_ignored, parse_ignore_file
+from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from sshmirror.prompts import _questionary_available
 
 
@@ -165,6 +165,62 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(connect_mock.call_count, 1)
                 restart_test_mock.assert_not_awaited()
 
+    def test_restart_container_uses_configured_sudo_password(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                callbacks = SSHMirrorCallbacks(secret=lambda _prompt: 'ignored-secret')
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                            'sudo': True,
+                            'sudo_password': 'configured-secret',
+                        },
+                    ),
+                    callbacks=callbacks,
+                )
+
+                command = mirror._build_restart_container_docker_cmd('restart')
+
+                self.assertIn('printf %s\\n configured-secret | sudo -S -k docker restart app', command)
+
+    def test_restart_container_prompts_for_sudo_password_once(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                secret_mock = Mock(return_value='prompted-secret')
+                callbacks = SSHMirrorCallbacks(secret=secret_mock)
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                            'sudo': True,
+                        },
+                    ),
+                    callbacks=callbacks,
+                )
+
+                first_command = mirror._build_restart_container_docker_cmd('restart')
+                second_command = mirror._build_restart_container_docker_cmd('inspect --type container')
+
+                self.assertIn('printf %s\\n prompted-secret | sudo -S -k docker restart app', first_command)
+                self.assertIn(
+                    'printf %s\\n prompted-secret | sudo -S -k docker inspect --type container app',
+                    second_command,
+                )
+                secret_mock.assert_called_once_with('Sudo password for Docker host')
+
     def test_cli_help_mentions_docker_host_for_restart_connection(self):
         help_text = build_parser().format_help()
         normalized_help_text = re.sub(r'\x1b\[[0-9;]*m', '', help_text)
@@ -261,6 +317,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             self.assertTrue(check_path_is_ignored('logs/debug.log', ignore_rules))
             self.assertTrue(check_path_is_ignored('cache/tmp', ignore_rules))
             self.assertTrue(check_path_is_ignored('cache/tmp/data.json', ignore_rules))
+            self.assertTrue(check_path_is_ignored('node_modules', ignore_rules, is_dir=True))
             self.assertFalse(check_path_is_ignored('src/app.py', ignore_rules))
 
     def test_filewatcher_skips_ignored_paths(self):
@@ -285,6 +342,32 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             self.assertIn('src/main.py', filemap.path_list())
             self.assertNotIn('ignored/secret.txt', filemap.path_list())
             self.assertNotIn('src/draft.tmp', filemap.path_list())
+
+    def test_filewatcher_does_not_scan_ignored_directories(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            ignore_path = tmp_path / 'sshmirror.ignore.txt'
+            ignore_path.write_text('ignored/\n', encoding='utf-8')
+
+            ignored_dir = tmp_path / 'ignored'
+            included_dir = tmp_path / 'src'
+            ignored_dir.mkdir(parents=True, exist_ok=True)
+            included_dir.mkdir(parents=True, exist_ok=True)
+            (ignored_dir / 'secret.txt').write_text('skip\n', encoding='utf-8')
+            (included_dir / 'main.py').write_text('print(1)\n', encoding='utf-8')
+
+            original_scandir = os.scandir
+            scanned_paths: list[str] = []
+
+            def tracking_scandir(path):
+                scanned_paths.append(str(path).replace('\\', '/'))
+                return original_scandir(path)
+
+            with working_directory(tmp_path), patch('sshmirror.core.filewatcher.os.scandir', side_effect=tracking_scandir):
+                asyncio.run(Filewatcher('.', str(ignore_path)).get_filemap())
+
+            ignored_scans = [path for path in scanned_paths if Path(path).name == 'ignored' and path not in {'.', './'}]
+            self.assertEqual(ignored_scans, [])
 
     def test_library_mode_auto_detects_ignore_file_from_localdir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -417,6 +500,46 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertTrue(conflict_copy.exists())
                 self.assertEqual(conflict_copy.read_text(encoding='utf-8'), 'local-change/\n')
                 self.assertTrue((tmp_path / '.sshmirror' / 'conflicts.json').exists())
+
+    def test_remote_scan_prunes_ignored_directories(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            ignore_path = tmp_path / 'sshmirror.ignore.txt'
+            ignore_path.write_text('node_modules/\ncache/tmp/\n*.log\n', encoding='utf-8')
+
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                commands: list[str] = []
+
+                async def fake_run(command, check=False):
+                    commands.append(command)
+
+                    class Result:
+                        stdout = ''
+                        stderr = ''
+                        exit_status = 0
+
+                    return Result()
+
+                dummy_conn = object.__new__(SSHClientConnection)
+                dummy_conn.run = AsyncMock(side_effect=fake_run)
+
+                asyncio.run(mirror._get_remote_map(dummy_conn))
+
+            self.assertEqual(len(commands), 2)
+            self.assertIn('-prune', commands[0])
+            self.assertIn("-name node_modules", commands[0])
+            self.assertIn("-path /app/cache/tmp", commands[0])
+            self.assertIn("! -name '*.log'", commands[0])
 
     def test_push_prompts_for_version_message_after_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

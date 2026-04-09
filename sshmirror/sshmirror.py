@@ -27,14 +27,14 @@ try:
     from .core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
     from .core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from .core.filewatcher import Filewatcher
-    from .core.utils import check_path_is_ignored, clear_n_console_rows, parse_ignore_file, read_text_file, write_text_file_atomic_async
+    from .core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
     from .core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
     from core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
     from core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from core.filewatcher import Filewatcher
-    from core.utils import check_path_is_ignored, clear_n_console_rows, parse_ignore_file, read_text_file, write_text_file_atomic_async
+    from core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
     from core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
 
 console = Console()
@@ -188,6 +188,7 @@ class SSHMirror:
         self.ignore_file_path = None
 
         self.filewatcher = Filewatcher(self.localdir, None)
+        self._runtime_restart_sudo_password = None
 
         self._refresh_ignore_file_path()
 
@@ -834,6 +835,28 @@ class SSHMirror:
             and restart_connect_kwargs['username'] == self.username
         )
 
+    def _get_restart_container_sudo_password(self) -> str | None:
+        if self.restart_container is None:
+            return None
+
+        sudo_password = self.restart_container.get(
+            'sudo_password',
+            self.restart_container.get('password', self.password),
+        )
+        if sudo_password:
+            return sudo_password
+        if self._runtime_restart_sudo_password:
+            return self._runtime_restart_sudo_password
+        if self.callbacks.secret is None:
+            return None
+
+        provided_password = self.callbacks.secret('Sudo password for Docker host')
+        normalized_password = provided_password.strip()
+        if normalized_password:
+            self._runtime_restart_sudo_password = normalized_password
+            return normalized_password
+        return None
+
     def _build_restart_container_docker_cmd(self, docker_subcommand: str) -> str:
         if self.restart_container is None:
             raise ValueError('restart_container is not configured')
@@ -842,10 +865,7 @@ class SSHMirror:
         if not self.restart_container.get('sudo', False):
             return docker_cmd
 
-        sudo_password = self.restart_container.get(
-            'sudo_password',
-            self.restart_container.get('password', self.password),
-        )
+        sudo_password = self._get_restart_container_sudo_password()
         if sudo_password:
             return f'printf %s\\n {shlex.quote(sudo_password)} | sudo -S -k {docker_cmd}'
 
@@ -1602,6 +1622,40 @@ class SSHMirror:
     def _normalize_remote_mtime(value: str) -> int:
         return int(float(value.strip()) * 1_000_000_000)
 
+    def _build_remote_find_commands(self, ignore_list) -> tuple[str, str]:
+        remote_root = self.remotedir.rstrip('/') or '/'
+        prune_terms: list[str] = []
+        file_excludes: list[str] = []
+
+        for ignore_rule in ignore_list.prunable_component_rules:
+            prune_terms.append(f'-name {shlex.quote(ignore_rule.normalized)}')
+
+        for ignore_rule in ignore_list.prunable_path_rules:
+            remote_path = os.path.join(remote_root, ignore_rule.normalized).replace('\\', '/')
+            prune_terms.append(f'-path {shlex.quote(remote_path)}')
+
+        for ignore_rule in ignore_list.component_rules:
+            if ignore_rule.directory_only:
+                continue
+            file_excludes.append(f'! -name {shlex.quote(ignore_rule.normalized)}')
+
+        for ignore_rule in ignore_list.slash_rules:
+            if ignore_rule.directory_only:
+                continue
+            remote_path = os.path.join(remote_root, ignore_rule.normalized).replace('\\', '/')
+            file_excludes.append(f'! -path {shlex.quote(remote_path)}')
+            file_excludes.append(f'! -path {shlex.quote(remote_path + "/*")}')
+
+        prune_prefix = ''
+        if prune_terms:
+            prune_prefix = f"\\( -type d \\( {' -o '.join(prune_terms)} \\) -prune \\) -o "
+
+        file_filters = '' if not file_excludes else ' ' + ' '.join(file_excludes)
+        root_arg = shlex.quote(remote_root)
+        cmd_files = f"find {root_arg} {prune_prefix}-type f{file_filters} -printf '%P\\t%s\\t%T@\\n'"
+        cmd_dirs = f"find {root_arg} {prune_prefix}-type d -printf '%P\\n'"
+        return cmd_files, cmd_dirs
+
     async def _get_remote_file_hashes(self, conn: SSHClientConnection, paths: list[str]) -> dict[str, str]:
         sem = asyncio.Semaphore(4)
 
@@ -1616,10 +1670,8 @@ class SSHMirror:
         return {path: md5 for path, md5 in pairs}
 
     async def _get_remote_map(self, conn: SSHClientConnection, reference_map: FileMap | None = None) -> FileMap:
-        ignore_list = parse_ignore_file(self.ignore_file_path)
-        exclude_cmd = ''
-        cmd_files = f"find {self.remotedir} {exclude_cmd} -type f -printf '%P\\t%s\\t%T@\\n'"
-        cmd_dirs = f"find {self.remotedir} {exclude_cmd} -type d -printf '%P\\n'"
+        ignore_list = compile_ignore_rules(parse_ignore_file(self.ignore_file_path))
+        cmd_files, cmd_dirs = self._build_remote_find_commands(ignore_list)
         result_files, result_dirs = await asyncio.gather(conn.run(cmd_files), conn.run(cmd_dirs))
         filemap = FileMap()
         pending_hash_paths: list[str] = []
@@ -1631,7 +1683,7 @@ class SSHMirror:
             path = path.strip()
             if len(path) == 0:
                 continue
-            if check_path_is_ignored(path, ignore_list):
+            if check_path_is_ignored(path, ignore_list, is_dir=False):
                 continue
             normalized_size = int(size)
             normalized_mtime = self._normalize_remote_mtime(mtime)
@@ -1652,7 +1704,7 @@ class SSHMirror:
             path = path.strip()
             if len(path) == 0:
                 continue
-            if not check_path_is_ignored(path, ignore_list):
+            if not check_path_is_ignored(path, ignore_list, is_dir=True):
                 filemap.add_directory(path)
     
         return filemap

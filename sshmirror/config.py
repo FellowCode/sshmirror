@@ -18,6 +18,7 @@ class SSHMirrorCallbacks:
     confirm: typing.Callable[[str], bool] | None = None
     choose: typing.Callable[[str, list[str]], str] | None = None
     text: typing.Callable[[str, str], str] | None = None
+    secret: typing.Callable[[str], str] | None = None
 
 
 @dataclass(slots=True)

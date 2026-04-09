@@ -6,13 +6,13 @@ import sys
 
 try:
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
-    from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_text
+    from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from .sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from .core.exceptions import UserAbort
     from .core.utils import read_text_file
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
-    from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_text
+    from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from core.exceptions import UserAbort
     from core.utils import read_text_file
@@ -253,6 +253,7 @@ def _create_mirror_from_args(args: argparse.Namespace) -> SSHMirror:
     if args.config and os.path.exists(args.config):
         callbacks = SSHMirrorCallbacks(confirm=prompt_confirm, choose=prompt_choice)
         callbacks.text = prompt_text
+        callbacks.secret = prompt_secret
         return SSHMirror(
             config=SSHMirrorConfig.from_file(
                 args.config,

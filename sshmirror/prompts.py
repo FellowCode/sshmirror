@@ -1,4 +1,5 @@
 import asyncio
+import getpass
 import os
 import typing
 
@@ -107,6 +108,17 @@ def prompt_text(prompt: str, default: str = 'update') -> str:
 
     value = input(f'{prompt} [{default}]: ').strip()
     return value or default
+
+
+def prompt_secret(prompt: str) -> str:
+    result = _questionary_ask(
+        lambda: questionary.password(prompt),
+        'Interactive questionary password input is unavailable, fallback to hidden input',
+    )
+    if result is not None:
+        return result
+
+    return getpass.getpass(f'{prompt}: ').strip()
 
 
 def prompt_discard_files() -> list[str]:

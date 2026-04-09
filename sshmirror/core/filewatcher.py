@@ -4,7 +4,7 @@ import inspect
 import re
 import typing
 import asyncio
-from .utils import check_path_is_ignored, parse_ignore_file
+from .utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 
 
 
@@ -15,26 +15,26 @@ class Filewatcher:
         self.last_filemap = None
         
     @classmethod
-    async def _scantree(cls, path: str, ignore_list: list[re.Pattern]):
+    async def _scantree(cls, path: str, ignore_list):
         """Recursively yield DirEntry objects for given directory."""
         for entry in os.scandir(path):
-            path = entry.path.replace('\\', '/')
-            if path.startswith('./'):
-                path = path[2:]
-            if check_path_is_ignored(path, ignore_list):
+            entry_path = entry.path.replace('\\', '/')
+            if entry_path.startswith('./'):
+                entry_path = entry_path[2:]
+            is_directory = entry.is_dir(follow_symlinks=False)
+            if check_path_is_ignored(entry_path, ignore_list, is_dir=is_directory):
                 continue
-            if entry.is_dir(follow_symlinks=False):
+            if is_directory:
                 yield entry
-                if entry.is_dir():
-                    await asyncio.sleep(0)
-                    async for entry2 in cls._scantree(entry.path, ignore_list):
-                        yield entry2
+                await asyncio.sleep(0)
+                async for entry2 in cls._scantree(entry.path, ignore_list):
+                    yield entry2
             else:
                 yield entry
     
     @classmethod
     async def _create_map(cls, directory: str, ignore_file_path: str, reference_map: FileMap | None = None) -> FileMap:
-        ignore_list = parse_ignore_file(ignore_file_path) if ignore_file_path is not None else []
+        ignore_list = compile_ignore_rules(parse_ignore_file(ignore_file_path) if ignore_file_path is not None else [])
         filemap = FileMap()
         async for entry in cls._scantree(directory, ignore_list):
             path = entry.path.replace('\\', '/')
