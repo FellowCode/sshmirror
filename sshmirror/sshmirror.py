@@ -77,6 +77,7 @@ def _prompt_initialization_source() -> str:
 class SSHMirror:
     WARNING_SIZE = 10 * 1024 * 1024 # 100Mb
     DIFF_CONTEXT_LINES = 2
+    VERSION_MESSAGE_MAX_LENGTH = 50
     versions_directory = '.sshmirror/versions'
     migrations_directory = '.sshmirror/migrations'
     conflicts_file = '.sshmirror/conflicts.json'
@@ -317,18 +318,33 @@ class SSHMirror:
 
     @staticmethod
     def _format_version_label(version: DirVersion) -> str:
+        display_dt = version.dt.astimezone(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        author = (version.author or '').strip()
         message = (version.message or 'update').strip() or 'update'
-        return f'{version.dt.isoformat()} | {version.uid[:8]} | {message}'
+        if author:
+            return f'{display_dt} | {version.uid[:8]} | {author} | {message}'
+        return f'{display_dt} | {version.uid[:8]} | {message}'
 
     @staticmethod
     def _normalize_version_message(message: str | None) -> str:
         normalized = (message or '').strip()
-        return normalized or 'update'
+        if normalized == '':
+            return 'update'
+        if len(normalized) > SSHMirror.VERSION_MESSAGE_MAX_LENGTH:
+            raise ValueError(
+                f'Version description must be at most {SSHMirror.VERSION_MESSAGE_MAX_LENGTH} characters long'
+            )
+        return normalized
 
     def _prompt_version_message(self) -> str:
         if self.callbacks.text is None:
             return 'update'
-        return self._normalize_version_message(self.callbacks.text('Version description', 'update'))
+        return self._normalize_version_message(
+            self.callbacks.text(
+                f'Version description (max {self.VERSION_MESSAGE_MAX_LENGTH} chars)',
+                'update',
+            )
+        )
 
     def _confirm(self, message: str, abort_message: str) -> bool:
         if self.callbacks.confirm is None:
@@ -659,9 +675,55 @@ class SSHMirror:
             versions = await self._get_remote_versions_stack(conn)
 
         return [
-            DiffVersionInfo(uid=version.uid, label=self._format_version_label(version), dt=version.dt.isoformat(), author=version.author, message=version.message)
-            for version in versions
+            DiffVersionInfo(
+                uid=version.uid,
+                label=self._format_version_label(version),
+                dt=version.dt.isoformat(),
+                author=version.author,
+                message=version.message,
+                index=index,
+            )
+            for index, version in enumerate(versions)
         ]
+
+    async def list_remote_versions_page(
+        self,
+        page: int = 0,
+        page_size: int = 20,
+        start_index: int = 0,
+    ) -> tuple[list[DiffVersionInfo], int]:
+        async with asyncssh.connect(**self._build_connect_kwargs(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth_kwargs=self.auth_kwargs,
+        )) as conn:
+            page_filenames, total_versions, start, _end = await self._get_remote_version_page_filenames(
+                conn,
+                page=page,
+                page_size=page_size,
+                start_index=start_index,
+            )
+            if total_versions == 0:
+                return [], 0
+            versions = await self._load_remote_versions_by_filenames(conn, page_filenames)
+
+        page_infos: list[DiffVersionInfo] = []
+        for relative_index, version, filename in zip(range(start, start + len(versions)), versions, page_filenames):
+            page_infos.append(
+                DiffVersionInfo(
+                    uid=version.uid,
+                    label=self._format_version_label(version),
+                    dt=version.dt.isoformat(),
+                    author=version.author,
+                    message=version.message,
+                    index=start_index + relative_index,
+                    filename=filename,
+                )
+            )
+
+        page_infos.reverse()
+        return page_infos, total_versions
 
     async def list_version_changes(self, base_version_uid: str, target_version_uid: str) -> list[DiffFileChange]:
         async with asyncssh.connect(**self._build_connect_kwargs(
@@ -670,17 +732,37 @@ class SSHMirror:
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
-            versions = await self._get_remote_versions_stack(conn)
+            version_filenames = await self._get_remote_version_filenames(conn)
+            base_filename = self._find_remote_version_filename(version_filenames, base_version_uid)
+            target_filename = self._find_remote_version_filename(version_filenames, target_version_uid)
+            if base_filename is None:
+                raise ValueError(f'Unknown base version uid {base_version_uid}')
+            if target_filename is None:
+                raise ValueError(f'Unknown target version uid {target_version_uid}')
 
-        version_map = {version.uid: version for version in versions}
-        if base_version_uid not in version_map:
+            base_index = version_filenames.index(base_filename)
+            target_index = version_filenames.index(target_filename)
+            if base_index >= target_index:
+                raise ValueError('Target version must be later than base version')
+
+            base_version, target_version = await self._load_remote_versions_by_filenames(conn, [base_filename, target_filename])
+
+        if base_version is None:
             raise ValueError(f'Unknown base version uid {base_version_uid}')
-        if target_version_uid not in version_map:
+        if target_version is None:
             raise ValueError(f'Unknown target version uid {target_version_uid}')
-        base_version = version_map[base_version_uid]
-        target_version = version_map[target_version_uid]
-        if versions.index(base_version) >= versions.index(target_version):
-            raise ValueError('Target version must be later than base version')
+
+        migration = base_version.filemap.migrate_to(target_version.filemap)
+        return self._build_file_actions(migration, created_action='create', deleted_action='delete')
+
+    async def list_version_changes_by_filenames(self, base_filename: str, target_filename: str) -> list[DiffFileChange]:
+        async with asyncssh.connect(**self._build_connect_kwargs(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth_kwargs=self.auth_kwargs,
+        )) as conn:
+            base_version, target_version = await self._load_remote_versions_by_filenames(conn, [base_filename, target_filename])
 
         migration = base_version.filemap.migrate_to(target_version.filemap)
         return self._build_file_actions(migration, created_action='create', deleted_action='delete')
@@ -692,7 +774,21 @@ class SSHMirror:
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
-            versions = await self._get_remote_versions_stack(conn)
+            version_filenames = await self._get_remote_version_filenames(conn)
+            base_filename = self._find_remote_version_filename(version_filenames, base_version_uid)
+            target_filename = self._find_remote_version_filename(version_filenames, target_version_uid)
+            if base_filename is None:
+                raise ValueError(f'Unknown base version uid {base_version_uid}')
+            if target_filename is None:
+                raise ValueError(f'Unknown target version uid {target_version_uid}')
+
+            base_index = version_filenames.index(base_filename)
+            target_index = version_filenames.index(target_filename)
+            if base_index >= target_index:
+                raise ValueError('Target version must be later than base version')
+
+            selected_filenames = version_filenames[base_index:target_index + 1]
+            versions = await self._load_remote_versions_by_filenames(conn, selected_filenames)
             migration_cache: dict[str, MigrationChanges] = {}
             version_map = {version.uid: version for version in versions}
             if base_version_uid not in version_map:
@@ -728,6 +824,164 @@ class SSHMirror:
 
             before_text = await self._get_remote_version_file_text(conn, versions, base_index, path, migration_cache) if file_action.action != 'create' else ''
             after_text = await self._get_remote_version_file_text(conn, versions, target_index, path, migration_cache) if file_action.action != 'delete' else ''
+            if before_text is None or after_text is None:
+                return DiffDetail(
+                    path=path,
+                    action=file_action.action,
+                    before_label=base_version.uid[:8],
+                    after_label=target_version.uid[:8],
+                    before_entry=self._entry_asdict(before_entry),
+                    after_entry=self._entry_asdict(after_entry),
+                    text_available=False,
+                    message='Server downgrade snapshot is unavailable for one of the selected versions.',
+                )
+
+            return DiffDetail(
+                path=path,
+                action=file_action.action,
+                before_label=base_version.uid[:8],
+                after_label=target_version.uid[:8],
+                before_text=before_text,
+                after_text=after_text,
+                before_entry=self._entry_asdict(before_entry),
+                after_entry=self._entry_asdict(after_entry),
+            )
+
+    async def get_version_change_detail_by_filenames(self, base_filename: str, target_filename: str, path: str) -> DiffDetail:
+        async with asyncssh.connect(**self._build_connect_kwargs(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth_kwargs=self.auth_kwargs,
+        )) as conn:
+            base_index = await self._get_remote_version_index_by_filename(conn, base_filename)
+            target_index = await self._get_remote_version_index_by_filename(conn, target_filename)
+            if base_index is None:
+                raise ValueError(f'Unknown base version filename {base_filename}')
+            if target_index is None:
+                raise ValueError(f'Unknown target version filename {target_filename}')
+            if base_index >= target_index:
+                raise ValueError('Target version must be later than base version')
+
+            selected_filenames = await self._get_remote_version_filenames_in_range(conn, base_index, target_index)
+            versions = await self._load_remote_versions_by_filenames(conn, selected_filenames)
+            migration_cache: dict[str, MigrationChanges] = {}
+            version_map = {version.filename(): version for version in versions}
+            if base_filename not in version_map:
+                raise ValueError(f'Unknown base version filename {base_filename}')
+            if target_filename not in version_map:
+                raise ValueError(f'Unknown target version filename {target_filename}')
+            base_version = version_map[base_filename]
+            target_version = version_map[target_filename]
+            base_index = versions.index(base_version)
+            target_index = versions.index(target_version)
+            if base_index >= target_index:
+                raise ValueError('Target version must be later than base version')
+
+            migration = base_version.filemap.migrate_to(target_version.filemap)
+            file_action = self._find_file_action(
+                self._build_file_actions(migration, created_action='create', deleted_action='delete'),
+                path,
+            )
+            before_entry = base_version.filemap.get_file(path)
+            after_entry = target_version.filemap.get_file(path)
+            if self._is_large_diff_file(before_entry, after_entry):
+                return DiffDetail(
+                    path=path,
+                    action=file_action.action,
+                    before_label=base_version.uid[:8],
+                    after_label=target_version.uid[:8],
+                    before_entry=self._entry_asdict(before_entry),
+                    after_entry=self._entry_asdict(after_entry),
+                    is_large=True,
+                    text_available=False,
+                    message='Viewing textual diff for large files is unavailable.',
+                )
+
+            before_text = await self._get_remote_version_file_text(conn, versions, base_index, path, migration_cache) if file_action.action != 'create' else ''
+            after_text = await self._get_remote_version_file_text(conn, versions, target_index, path, migration_cache) if file_action.action != 'delete' else ''
+            if before_text is None or after_text is None:
+                return DiffDetail(
+                    path=path,
+                    action=file_action.action,
+                    before_label=base_version.uid[:8],
+                    after_label=target_version.uid[:8],
+                    before_entry=self._entry_asdict(before_entry),
+                    after_entry=self._entry_asdict(after_entry),
+                    text_available=False,
+                    message='Server downgrade snapshot is unavailable for one of the selected versions.',
+                )
+
+            return DiffDetail(
+                path=path,
+                action=file_action.action,
+                before_label=base_version.uid[:8],
+                after_label=target_version.uid[:8],
+                before_text=before_text,
+                after_text=after_text,
+                before_entry=self._entry_asdict(before_entry),
+                after_entry=self._entry_asdict(after_entry),
+            )
+
+    async def get_version_change_detail_by_range(
+        self,
+        base_filename: str,
+        target_filename: str,
+        base_index: int | None,
+        target_index: int | None,
+        path: str,
+    ) -> DiffDetail:
+        if base_index is None:
+            raise ValueError('Base version is missing index information')
+        if target_index is None:
+            raise ValueError('Target version is missing index information')
+        if base_index >= target_index:
+            raise ValueError('Target version must be later than base version')
+
+        async with asyncssh.connect(**self._build_connect_kwargs(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth_kwargs=self.auth_kwargs,
+        )) as conn:
+            selected_filenames = await self._get_remote_version_filenames_in_range(conn, base_index, target_index)
+            versions = await self._load_remote_versions_by_filenames(conn, selected_filenames)
+            migration_cache: dict[str, MigrationChanges] = {}
+            version_map = {version.filename(): version for version in versions}
+            if base_filename not in version_map:
+                raise ValueError(f'Unknown base version filename {base_filename}')
+            if target_filename not in version_map:
+                raise ValueError(f'Unknown target version filename {target_filename}')
+
+            base_version = version_map[base_filename]
+            target_version = version_map[target_filename]
+            base_range_index = versions.index(base_version)
+            target_range_index = versions.index(target_version)
+            if base_range_index >= target_range_index:
+                raise ValueError('Target version must be later than base version')
+
+            migration = base_version.filemap.migrate_to(target_version.filemap)
+            file_action = self._find_file_action(
+                self._build_file_actions(migration, created_action='create', deleted_action='delete'),
+                path,
+            )
+            before_entry = base_version.filemap.get_file(path)
+            after_entry = target_version.filemap.get_file(path)
+            if self._is_large_diff_file(before_entry, after_entry):
+                return DiffDetail(
+                    path=path,
+                    action=file_action.action,
+                    before_label=base_version.uid[:8],
+                    after_label=target_version.uid[:8],
+                    before_entry=self._entry_asdict(before_entry),
+                    after_entry=self._entry_asdict(after_entry),
+                    is_large=True,
+                    text_available=False,
+                    message='Viewing textual diff for large files is unavailable.',
+                )
+
+            before_text = await self._get_remote_version_file_text(conn, versions, base_range_index, path, migration_cache) if file_action.action != 'create' else ''
+            after_text = await self._get_remote_version_file_text(conn, versions, target_range_index, path, migration_cache) if file_action.action != 'delete' else ''
             if before_text is None or after_text is None:
                 return DiffDetail(
                     path=path,
@@ -1537,11 +1791,96 @@ class SSHMirror:
         s = (await conn.run(f'cat {self.remotedir}{self.versions_directory}/{version}')).stdout
         return DirVersion.loads(s)
     
-    async def _get_remote_versions_stack(self, conn: SSHClientConnection, start_version: DirVersion | None = None, last_n: int | None = None) -> list[DirVersion]:
-        result = await conn.run(f'ls {self.remotedir}{self.versions_directory}')
-        if result.stdout.strip() == '':
+    async def _get_remote_version_filenames(self, conn: SSHClientConnection) -> list[str]:
+        result = await conn.run(self._build_remote_version_listing_command(), check=False)
+        if result.exit_status != 0 or result.stdout.strip() == '':
             return []
-        version_filenames = sorted(result.stdout.strip().split('\n'))
+        return result.stdout.strip().split('\n')
+
+    def _build_remote_version_listing_command(self) -> str:
+        versions_path = shlex.quote(self._remote_get_abs_path(self.versions_directory))
+        return f"find {versions_path} -maxdepth 1 -type f -printf '%f\\n' | sort"
+
+    async def _get_remote_version_count(self, conn: SSHClientConnection, start_index: int = 0) -> int:
+        listing_command = self._build_remote_version_listing_command()
+        if start_index > 0:
+            listing_command = f"{listing_command} | sed -n '{start_index + 1},$p'"
+        result = await conn.run(f"{listing_command} | wc -l", check=False)
+        if result.exit_status != 0 or result.stdout.strip() == '':
+            return 0
+        return int(result.stdout.strip())
+
+    async def _get_remote_version_filenames_in_range(self, conn: SSHClientConnection, start_index: int, end_index: int) -> list[str]:
+        if end_index < start_index:
+            return []
+        listing_command = self._build_remote_version_listing_command()
+        result = await conn.run(
+            f"{listing_command} | sed -n '{start_index + 1},{end_index + 1}p'",
+            check=False,
+        )
+        if result.exit_status != 0 or result.stdout.strip() == '':
+            return []
+        return result.stdout.strip().split('\n')
+
+    async def _get_remote_version_page_filenames(
+        self,
+        conn: SSHClientConnection,
+        page: int,
+        page_size: int,
+        start_index: int = 0,
+    ) -> tuple[list[str], int, int, int]:
+        total_versions = await self._get_remote_version_count(conn, start_index=start_index)
+        if total_versions == 0:
+            return [], 0, 0, 0
+
+        normalized_page = max(0, page)
+        end = total_versions - (normalized_page * page_size)
+        start = max(0, end - page_size)
+        page_filenames = await self._get_remote_version_filenames_in_range(
+            conn,
+            start_index + start,
+            start_index + end - 1,
+        )
+        return page_filenames, total_versions, start, end
+
+    async def _get_remote_version_index_by_filename(self, conn: SSHClientConnection, filename: str) -> int | None:
+        version_filenames = await self._get_remote_version_filenames(conn)
+        try:
+            return version_filenames.index(filename)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _find_remote_version_filename(version_filenames: list[str], version_uid: str) -> str | None:
+        suffix = f'_{version_uid}.json'
+        for filename in version_filenames:
+            if filename.endswith(suffix):
+                return filename
+        return None
+
+    async def _load_remote_versions_by_filenames(self, conn: SSHClientConnection, version_filenames: list[str]) -> list[DirVersion]:
+        if len(version_filenames) == 0:
+            return []
+
+        sem = asyncio.Semaphore(1)
+        async def sem_coro(c: SSHClientConnection, cmd: str):
+            async with sem:
+                return await c.run(cmd)
+
+        tasks = [sem_coro(conn, f'cat {self.remotedir}{self.versions_directory}/{filename}') for filename in version_filenames]
+        results = await asyncio.gather(*tasks)
+        versions = []
+        for i, result in enumerate(results):
+            try:
+                versions.append(DirVersion.loads(result.stdout))
+            except:
+                print(f'WARNING. On remote version file invalid format, {version_filenames[i]}')
+        return versions
+
+    async def _get_remote_versions_stack(self, conn: SSHClientConnection, start_version: DirVersion | None = None, last_n: int | None = None) -> list[DirVersion]:
+        version_filenames = await self._get_remote_version_filenames(conn)
+        if len(version_filenames) == 0:
+            return []
         if start_version is not None:
             assert last_n is None
             
@@ -1554,21 +1893,8 @@ class SSHMirror:
             version_filenames = version_filenames[start_index:]  
         elif last_n is not None:
             version_filenames = version_filenames[-last_n:]
-        
-        sem = asyncio.Semaphore(1)
-        async def sem_coro(c: SSHClientConnection, cmd: str):
-            async with sem:
-                return await c.run(cmd)
-            
-        tasks = [sem_coro(conn, f'cat {self.remotedir}{self.versions_directory}/{filename}') for filename in version_filenames]
-        results = await asyncio.gather(*tasks)
-        versions = [] 
-        for i, result in enumerate(results):
-            try:
-                versions.append(DirVersion.loads(result.stdout))
-            except:
-                print(f'WARNING. On remote version file invalid format, {version_filenames[i]}')
-        return versions
+
+        return await self._load_remote_versions_by_filenames(conn, version_filenames)
     
     async def _get_remote_migration_changes(self, conn: SSHClientConnection, version: DirVersion) -> MigrationChanges:
         res = await conn.run(f'cat {self.remotedir}{self.migrations_directory}/{version.name()}/_migration.json')

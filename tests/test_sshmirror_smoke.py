@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import asyncio
+import datetime
 import unittest
 from asyncssh import SSHClientConnection
 from contextlib import contextmanager
@@ -11,11 +12,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
-from sshmirror.cli import _build_interactive_menu_items, _configure_interactive_args, _create_default_config, build_parser
+from sshmirror.cli import _build_interactive_menu_items, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_page_prompt, _render_version_page, _show_version_changes_cli, build_parser
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
-from sshmirror.core.schemas import DiffDetail
+from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo
 from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from sshmirror.prompts import _questionary_available
 
@@ -155,6 +156,122 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 )
 
                 mirror.render_diff_detail(detail)
+
+    def test_version_label_uses_readable_utc_timestamp(self):
+        version = DirVersion(
+            dt=datetime.datetime(2026, 4, 9, 12, 34, 56, tzinfo=datetime.timezone.utc),
+            uid='1234567890abcdef',
+            author='alice',
+            message='deploy api',
+            filemap=FileMap(),
+        )
+
+        label = SSHMirror._format_version_label(version)
+
+        self.assertEqual(label, '2026-04-09 12:34:56 UTC | 12345678 | alice | deploy api')
+
+    def test_build_version_page_choices_reports_navigation_flags(self):
+        has_newer, has_older, total_pages = _build_version_page_choices(total_versions=45, page=0)
+
+        self.assertFalse(has_newer)
+        self.assertTrue(has_older)
+        self.assertEqual(total_pages, 3)
+
+    def test_format_version_page_prompt_includes_range_summary(self):
+        prompt = _format_version_page_prompt('Choose base version', page=0, total_versions=45)
+
+        self.assertEqual(prompt, 'Choose base version (page 1/3, showing 26-45 of 45, newest first)')
+
+    def test_choose_version_interactively_supports_pagination(self):
+        versions_page_1 = [
+            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index)
+            for index in range(24, 4, -1)
+        ]
+        versions_page_2 = [
+            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index)
+            for index in range(4, -1, -1)
+        ]
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(side_effect=[
+            (versions_page_1, 25),
+            (versions_page_2, 25),
+        ])
+
+        with patch('sshmirror.cli.prompt_choice', side_effect=['Older versions', '4']) as prompt_mock:
+            selected = asyncio.run(_choose_version_interactively(mirror, 'Choose base version'))
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.uid, '1')
+        self.assertEqual(mirror.list_remote_versions_page.await_count, 2)
+        self.assertEqual(prompt_mock.call_args_list[0].args[0], 'Choose version number')
+
+    def test_show_version_changes_cli_uses_paginated_version_selection(self):
+        versions_first_page = [
+            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index, filename=f'version-{index}.json')
+            for index in range(24, 4, -1)
+        ]
+        versions_target_page = [
+            DiffVersionInfo(uid='11', label='version-11', dt='dt-11', index=11, filename='version-11.json'),
+            DiffVersionInfo(uid='10', label='version-10', dt='dt-10', index=10, filename='version-10.json'),
+            DiffVersionInfo(uid='9', label='version-9', dt='dt-9', index=9, filename='version-9.json'),
+            DiffVersionInfo(uid='8', label='version-8', dt='dt-8', index=8, filename='version-8.json'),
+            DiffVersionInfo(uid='7', label='version-7', dt='dt-7', index=7, filename='version-7.json'),
+            DiffVersionInfo(uid='6', label='version-6', dt='dt-6', index=6, filename='version-6.json'),
+            DiffVersionInfo(uid='5', label='version-5', dt='dt-5', index=5, filename='version-5.json'),
+        ]
+        file_changes = [DiffFileChange(action='change', path='src/app.py')]
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(side_effect=[
+            (versions_first_page, 25),
+            (versions_first_page, 25),
+            (versions_target_page, 7),
+        ])
+        mirror.list_version_changes_by_filenames = AsyncMock(return_value=file_changes)
+        mirror.get_version_change_detail_by_filenames = AsyncMock(
+            return_value=DiffDetail(
+                path='src/app.py',
+                action='change',
+                before_label='before',
+                after_label='after',
+                before_text='old',
+                after_text='new',
+            )
+        )
+        mirror.render_diff_detail = Mock()
+
+        with patch('sshmirror.cli.prompt_choice', side_effect=['16', '1', 'Back']):
+            asyncio.run(_show_version_changes_cli(mirror))
+
+        mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-9.json', 'version-11.json')
+        mirror.get_version_change_detail_by_filenames.assert_not_awaited()
+
+    def test_build_version_choice_map_uses_numeric_shortcuts(self):
+        page_versions = [
+            DiffVersionInfo(uid='a', label='version-a', dt='dt-a'),
+            DiffVersionInfo(uid='b', label='version-b', dt='dt-b'),
+        ]
+
+        choice_map = _build_version_choice_map(page_versions)
+
+        self.assertEqual(list(choice_map.keys()), ['1', '2'])
+        self.assertEqual(choice_map['2'].uid, 'b')
+
+    def test_render_version_page_displays_author_column(self):
+        page_versions = [
+            DiffVersionInfo(
+                uid='abcdef12',
+                label='2026-04-09 12:34:56 UTC | abcdef12 | alice | deploy api',
+                dt='2026-04-09T12:34:56+00:00',
+                author='alice',
+                message='deploy api',
+            )
+        ]
+
+        with patch('sshmirror.cli.console.print') as print_mock:
+            _render_version_page(page_versions, 'Choose base version')
+
+        rendered_table = print_mock.call_args_list[1].args[0]
+        self.assertEqual(rendered_table.columns[2].header, 'Author')
 
     def test_restart_container_connection_defaults_to_main_connection(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -752,6 +869,39 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(version.message, 'feature sync')
                 remote_create_downgrade.assert_awaited_once()
                 self.assertEqual(remote_create_downgrade.await_args.args[2].message, 'feature sync')
+
+    def test_version_message_accepts_exactly_50_characters(self):
+        message = 'x' * 50
+
+        normalized = SSHMirror._normalize_version_message(message)
+
+        self.assertEqual(normalized, message)
+
+    def test_version_message_rejects_more_than_50_characters(self):
+        with self.assertRaisesRegex(ValueError, 'at most 50 characters'):
+            SSHMirror._normalize_version_message('x' * 51)
+
+    def test_prompt_version_message_uses_max_length_hint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            prompt_mock = Mock(return_value='short message')
+            callbacks = SSHMirrorCallbacks(text=prompt_mock)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    ),
+                    callbacks=callbacks,
+                )
+
+                message = mirror._prompt_version_message()
+
+            self.assertEqual(message, 'short message')
+            prompt_mock.assert_called_once_with('Version description (max 50 chars)', 'update')
 
 
 if __name__ == '__main__':

@@ -1,21 +1,32 @@
 import argparse
 import asyncio
+import math
 import os
 import signal
 import sys
+from collections import OrderedDict
 
 try:
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
+    from .core.schemas import DiffVersionInfo
+    from rich import box
+    from rich.table import Table
     from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from .sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from .core.exceptions import UserAbort
     from .core.utils import read_text_file
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
+    from core.schemas import DiffVersionInfo
+    from rich import box
+    from rich.table import Table
     from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from core.exceptions import UserAbort
     from core.utils import read_text_file
+
+
+VERSION_PAGE_SIZE = 20
 
 
 DEFAULT_CONFIG_TEMPLATE = """# SSH host or IP address used for the main sync connection.
@@ -51,7 +62,7 @@ restart_container:
     # Optional. If omitted, values from the main connection are reused.
     # host: '127.0.0.1'
     # port: '22'
-    # user: root
+    # username: root
 
     # Same auth rules as the main connection. If omitted here, values from the main
     # connection are reused, including the default user key fallback.
@@ -285,27 +296,122 @@ async def _show_current_changes_cli(mirror: SSHMirror) -> None:
         mirror.render_diff_detail(detail)
 
 
+def _build_version_page_choices(total_versions: int, page: int, page_size: int = VERSION_PAGE_SIZE) -> tuple[bool, bool, int]:
+    total_pages = max(1, math.ceil(total_versions / page_size))
+    normalized_page = max(0, min(page, total_pages - 1))
+    has_newer = normalized_page > 0
+    has_older = (normalized_page + 1) * page_size < total_versions
+    return has_newer, has_older, total_pages
+
+
+def _format_version_page_prompt(prompt: str, page: int, total_versions: int, page_size: int = VERSION_PAGE_SIZE) -> str:
+    total_pages = max(1, math.ceil(total_versions / page_size))
+    normalized_page = max(0, min(page, total_pages - 1))
+    if total_versions == 0:
+        return prompt
+
+    shown_to = total_versions - (normalized_page * page_size)
+    shown_from = max(1, shown_to - page_size + 1)
+    return f'{prompt} (page {normalized_page + 1}/{total_pages}, showing {shown_from}-{shown_to} of {total_versions}, newest first)'
+
+
+def _build_version_choice_map(page_versions: list[DiffVersionInfo]) -> OrderedDict[str, DiffVersionInfo]:
+    return OrderedDict((str(index), version) for index, version in enumerate(page_versions, start=1))
+
+
+def _render_version_page(page_versions: list[DiffVersionInfo], prompt: str) -> OrderedDict[str, DiffVersionInfo]:
+    choice_map = _build_version_choice_map(page_versions)
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style='bold cyan')
+    table.add_column('#', style='bold yellow', justify='right', width=3)
+    table.add_column('Time', style='green', min_width=20)
+    table.add_column('Author', style='magenta', min_width=10)
+    table.add_column('Version', style='cyan', width=10)
+    table.add_column('Message', style='white')
+
+    for number, version in choice_map.items():
+        label_parts = version.label.split(' | ')
+        time_part = label_parts[0] if len(label_parts) > 0 else version.dt
+        uid_part = label_parts[1] if len(label_parts) > 1 else version.uid[:8]
+        author = version.author or '-'
+        message = version.message or (label_parts[-1] if len(label_parts) > 2 else 'update')
+        table.add_row(number, time_part, author, uid_part, message)
+
+    console.print(prompt, style='bold yellow')
+    console.print(table)
+    return choice_map
+
+
+async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_index: int = 0) -> DiffVersionInfo | None:
+    page = 0
+    while True:
+        page_versions, total_versions = await mirror.list_remote_versions_page(
+            page=page,
+            page_size=VERSION_PAGE_SIZE,
+            start_index=start_index,
+        )
+        if total_versions == 0:
+            return None
+
+        has_newer, has_older, total_pages = _build_version_page_choices(total_versions, page)
+        page_prompt = prompt
+        if total_versions > VERSION_PAGE_SIZE:
+            page_prompt = _format_version_page_prompt(prompt, page, total_versions)
+
+        choice_map = _render_version_page(page_versions, page_prompt)
+        choices = list(choice_map.keys())
+        if has_newer:
+            choices.append('Newer versions')
+        if has_older:
+            choices.append('Older versions')
+        choices.append('Back')
+
+        choice_prompt = 'Choose version number'
+        choice = prompt_choice(choice_prompt, choices)
+        if choice == 'Back':
+            return None
+        if choice == 'Newer versions':
+            page -= 1
+            continue
+        if choice == 'Older versions':
+            page += 1
+            continue
+
+        selected = choice_map.get(choice)
+        if selected is not None:
+            return selected
+
+        raise ValueError(f'Unknown version choice {choice!r}')
+
+
 async def _show_version_changes_cli(mirror: SSHMirror) -> None:
     console.print('Connect to remote...', style='yellow')
-    versions = await mirror.list_remote_versions()
-    if len(versions) < 2:
+    _first_page_versions, total_versions = await mirror.list_remote_versions_page(page=0, page_size=VERSION_PAGE_SIZE)
+    if total_versions < 2:
         console.print('Need at least two remote versions to inspect changes', style='yellow')
         return
 
-    version_labels = {version.label: version for version in versions}
-    base_label = prompt_choice('Choose base version', list(version_labels.keys()))
-    base_version = version_labels[base_label]
-    base_index = versions.index(base_version)
-    later_versions = versions[base_index + 1:]
-    if len(later_versions) == 0:
+    base_version = await _choose_version_interactively(mirror, 'Choose base version')
+    if base_version is None:
+        return
+
+    if base_version.index is None:
+        raise ValueError('Selected version is missing index information')
+
+    if total_versions - (base_version.index + 1) <= 0:
         console.print('No later versions available for comparison', style='yellow')
         return
 
-    target_labels = {version.label: version for version in later_versions}
-    target_label = prompt_choice('Choose target version', list(target_labels.keys()))
-    target_version = target_labels[target_label]
+    if base_version.filename is None:
+        raise ValueError('Selected version is missing filename information')
 
-    file_actions = await mirror.list_version_changes(base_version.uid, target_version.uid)
+    target_version = await _choose_version_interactively(mirror, 'Choose target version', start_index=base_version.index + 1)
+    if target_version is None:
+        return
+
+    if target_version.filename is None:
+        raise ValueError('Selected version is missing filename information')
+
+    file_actions = await mirror.list_version_changes_by_filenames(base_version.filename, target_version.filename)
     if len(file_actions) == 0:
         console.print('No file changes between selected versions', style='yellow')
         return
@@ -316,7 +422,13 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         if choice == 'Back':
             return
 
-        detail = await mirror.get_version_change_detail(base_version.uid, target_version.uid, choice_map[choice].path)
+        detail = await mirror.get_version_change_detail_by_range(
+            base_version.filename,
+            target_version.filename,
+            base_version.index,
+            target_version.index,
+            choice_map[choice].path,
+        )
         mirror.render_diff_detail(detail)
 
 

@@ -175,6 +175,10 @@ Build locally:
 python -m build
 ```
 
+## Changelog
+
+Latest release notes live in [CHANGELOG.md](CHANGELOG.md).
+
 ## Status
 
 This repository is structured as a Python package with a CLI entry point. If you plan to publish to PyPI, keep package metadata, README, and license in sync with actual behavior.

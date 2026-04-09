@@ -4,11 +4,11 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'sshmirror'
-version = '0.1.9'
+version = '0.1.10'
 description = 'SSH directory synchronization library and CLI'
-readme = 'README.md'
 requires-python = '>=3.11'
 license = 'MIT'
+dynamic = ['readme']
 authors = [
     { name = 'FellowCode' },
 ]
@@ -41,12 +41,16 @@ dependencies = [
 Homepage = 'https://github.com/FellowCode/sshmirror'
 Repository = 'https://github.com/FellowCode/sshmirror'
 Issues = 'https://github.com/FellowCode/sshmirror/issues'
+Changelog = 'https://github.com/FellowCode/sshmirror/blob/main/CHANGELOG.md'
 
 [project.scripts]
 sshmirror = 'sshmirror.cli:main'
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+readme = { file = ['README.md', 'CHANGELOG.md'], content-type = 'text/markdown' }
 
 [tool.setuptools.packages.find]
 include = ['sshmirror', 'sshmirror.*']
