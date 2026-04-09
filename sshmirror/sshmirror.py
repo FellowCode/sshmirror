@@ -16,6 +16,7 @@ import shutil
 import aioshutil
 from rich import print
 from rich.console import Console
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -428,6 +429,81 @@ class SSHMirror:
                 after_text.stylize('bold black on green', j1, j2)
 
         return before_text, after_text
+
+    @staticmethod
+    def _build_sync_action_rows(migration: Migration, conflicts: Conflicts | None = None) -> list[tuple[str, str, str, str]]:
+        rows: list[tuple[str, str, str, str]] = []
+
+        for path in migration.dirs.created:
+            rows.append(('+', 'create dir', path, 'conflict' if conflicts and path in conflicts else 'pending'))
+        for path in migration.dirs.deleted:
+            rows.append(('-', 'delete dir', path, 'conflict' if conflicts and path in conflicts else 'pending'))
+        for path in migration.files.created:
+            rows.append(('+', 'create', path, 'conflict' if conflicts and path in conflicts else 'pending'))
+        for path in migration.files.changed:
+            rows.append(('~', 'update', path, 'conflict' if conflicts and path in conflicts else 'pending'))
+        for path in migration.files.deleted:
+            rows.append(('-', 'delete', path, 'conflict' if conflicts and path in conflicts else 'pending'))
+
+        return rows
+
+    @staticmethod
+    def _sync_action_style(action_name: str) -> str:
+        if action_name.startswith('create'):
+            return 'green bold'
+        if action_name.startswith('delete'):
+            return 'red bold'
+        if action_name == 'update':
+            return 'magenta bold'
+        return 'yellow bold'
+
+    @classmethod
+    def _render_sync_plan(
+        cls,
+        title: str,
+        subtitle: str,
+        migration: Migration,
+        *,
+        conflicts: Conflicts | None = None,
+        border_style: str = 'cyan',
+    ) -> None:
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style='dim', justify='right')
+        summary.add_column()
+        summary.add_row('files', f"+{len(migration.files.created)}  ~{len(migration.files.changed)}  -{len(migration.files.deleted)}")
+        summary.add_row('dirs', f"+{len(migration.dirs.created)}  -{len(migration.dirs.deleted)}")
+        if conflicts is not None and not conflicts.empty():
+            summary.add_row('conflicts', f'{len(conflicts.files) + len(conflicts.dirs)} items need local preservation')
+
+        details = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, pad_edge=False)
+        details.add_column('Action', width=12, no_wrap=True)
+        details.add_column('Path', ratio=1, overflow='fold')
+        details.add_column('Status', width=12, no_wrap=True)
+
+        for marker, action_name, path, status in cls._build_sync_action_rows(migration, conflicts):
+            details.add_row(
+                Text(f' {marker} {action_name.upper()} ', style=cls._sync_action_style(action_name)),
+                Text(path, style='white'),
+                Text(status, style='orange_red1' if status == 'conflict' else 'dim'),
+            )
+
+        if details.row_count == 0:
+            details.add_row(Text(' OK ', style='green bold'), Text('No changes', style='dim'), Text('clean', style='dim'))
+
+        console.print(
+            Panel(
+                Group(
+                    Text(subtitle, style='yellow'),
+                    Text(''),
+                    summary,
+                    Text(''),
+                    details,
+                ),
+                title=title,
+                border_style=border_style,
+                expand=True,
+            )
+        )
 
     @classmethod
     def _render_diff_row(
@@ -1741,22 +1817,23 @@ class SSHMirror:
 
     async def _pull(self, remote_versions: list[DirVersion], migration: Migration, conflicts: Conflicts | None, conn: SSHClientConnection,
                     ignore_version_exists=False, require_confirm: bool = True):
-        console.print('Pull', style='green bold')
-        console.print('This operations will be apply on local project:', style='yellow')
-        migration.print_actions(conflicts, prefix='  remote > ')
+        self._render_sync_plan(
+            'Pull',
+            'These changes will be applied to the local project.',
+            migration,
+            conflicts=conflicts,
+            border_style='green',
+        )
         
         if require_confirm:
             if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
                 raise UserAbort('Pull cancelled by user')
-            
-        clear_n_console_rows(len(migration.actions) + 2)
         
         await self._run_commands(self.commands.before_pull, migration, conn)
             
         if conflicts is not None and not conflicts.empty():
-            clear_n_console_rows(1)
             await self._resolve_conflicts(conflicts)
-            console.print('Pull', style='green bold')
+            console.print('Pull continues after preserving conflicted local files', style='green')
         
         for directory in migration.dirs.created:
             pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
@@ -1783,16 +1860,17 @@ class SSHMirror:
         await self._run_commands(self.commands.after_pull, migration, conn)
         
     async def _push(self, local_version: DirVersion, migration: Migration, conn: SSHClientConnection):
-        console.print('Push', style='green bold')
-        console.print('This operations will be apply on remote project:', style='yellow')
-        migration.print_actions(prefix='  remote < ')
+        self._render_sync_plan(
+            'Push',
+            'These changes will be applied to the remote project.',
+            migration,
+            border_style='cyan',
+        )
         
         if not self._confirm('Apply push changes?', 'Push cancelled by user'):
             raise UserAbort('Push cancelled by user')
 
         local_version.message = self._prompt_version_message()
-            
-        clear_n_console_rows(len(migration.actions) + 2)
         
         await self._remote_create_downgrade(conn, migration, local_version)
         

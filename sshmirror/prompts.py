@@ -32,7 +32,22 @@ def _questionary_ask(question_factory: typing.Callable[[], typing.Any], fallback
 
     try:
         question = question_factory()
-        result = question.ask()
+
+        try:
+            asyncio.get_running_loop()
+            has_running_loop = True
+        except RuntimeError:
+            has_running_loop = False
+
+        if has_running_loop:
+            # questionary.ask() calls asyncio.run() internally, which fails
+            # inside an existing event loop. Run in a separate thread instead.
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(1) as pool:
+                result = pool.submit(question.ask).result()
+        else:
+            result = question.ask()
+
         if result is None:
             raise UserAbort('Cancelled by user')
         return result
@@ -89,11 +104,17 @@ def _fallback_confirm_prompt(prompt: str) -> bool:
         console.print('Please answer yes or no', style='yellow')
 
 
-def prompt_choice(prompt: str, choices: list[str], default: str | None = None) -> str:
-    result = _questionary_ask(
-        lambda: questionary.select(prompt, choices=choices, default=default),
-        'Interactive questionary prompt is unavailable, fallback to plain input',
-    )
+def prompt_choice(prompt: str, choices: list[str], default: str | None = None, styled_choices: list | None = None, style: typing.Any = None) -> str:
+    if styled_choices is not None:
+        result = _questionary_ask(
+            lambda: questionary.select(prompt, choices=styled_choices, default=default, style=style),
+            'Interactive questionary prompt is unavailable, fallback to plain input',
+        )
+    else:
+        result = _questionary_ask(
+            lambda: questionary.select(prompt, choices=choices, default=default),
+            'Interactive questionary prompt is unavailable, fallback to plain input',
+        )
     if result is not _PROMPT_FALLBACK:
         return result
 

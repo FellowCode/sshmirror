@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.15
+
+### Changed
+
+- Improved interactive version history rendering with fixed-width columns for version number, timestamp, author, uid, and message.
+- Improved file change browsing so `changed`, `created`, and `deleted` entries are shown together with clearer color-coded styling.
+- Improved `push` and `pull` previews with structured summary panels and color-coded action tables before confirmation.
+
+## 0.1.14
+
+### Changed
+
+- Highlighted the selected base version during target version selection so the comparison source stays visible in interactive history browsing.
+
+### Fixed
+
+- Removed duplicated version history rendering so interactive diff browsing shows a single styled selection list instead of both a table and a separate prompt list.
+
+## 0.1.13
+
+### Fixed
+
+- Fixed interactive `questionary` prompts inside async CLI flows so they no longer fail with `asyncio.run() cannot be called from a running event loop`.
+- Fixed version and diff browsing prompts to run safely while the CLI event loop is active.
+
 ## 0.1.12
 
 ### Fixed

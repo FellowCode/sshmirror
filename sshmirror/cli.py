@@ -8,7 +8,7 @@ from collections import OrderedDict
 
 try:
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
-    from .core.schemas import DiffVersionInfo
+    from .core.schemas import DiffFileChange, DiffVersionInfo
     from rich import box
     from rich.table import Table
     from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
@@ -17,7 +17,7 @@ try:
     from .core.utils import read_text_file
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
-    from core.schemas import DiffVersionInfo
+    from core.schemas import DiffFileChange, DiffVersionInfo
     from rich import box
     from rich.table import Table
     from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
@@ -27,6 +27,11 @@ except ImportError:
 
 
 VERSION_PAGE_SIZE = 20
+VERSION_NUMBER_COLUMN_WIDTH = 5
+VERSION_TIME_COLUMN_WIDTH = 23
+VERSION_AUTHOR_COLUMN_WIDTH = 12
+VERSION_UID_COLUMN_WIDTH = 8
+VERSION_MESSAGE_COLUMN_WIDTH = 28
 
 
 DEFAULT_CONFIG_TEMPLATE = """# SSH host or IP address used for the main sync connection.
@@ -326,39 +331,154 @@ def _build_version_choice_map(page_versions: list[DiffVersionInfo]) -> OrderedDi
     return OrderedDict((_format_version_choice_label(version), version) for version in page_versions)
 
 
-def _format_version_choice_label(version: DiffVersionInfo) -> str:
-    global_number = (version.index + 1) if version.index is not None else 0
-    author = version.author or '-'
-    message = version.message or 'update'
-    uid = version.uid[:8]
+def _format_fixed_width_column(value: str, width: int) -> str:
+    normalized = (value or '-').strip() or '-'
+    if len(normalized) > width:
+        if width <= 3:
+            return normalized[:width]
+        normalized = normalized[:width - 3] + '...'
+    return normalized.ljust(width)
+
+
+def _format_version_choice_parts(version: DiffVersionInfo) -> tuple[str, str, str, str, str]:
+    global_number = f'{((version.index + 1) if version.index is not None else 0):>{VERSION_NUMBER_COLUMN_WIDTH}}'
     display_time = version.label.split(' | ')[0] if ' | ' in version.label else version.dt
-    return f'{global_number:>5} | {display_time} | {author} | {uid} | {message}'
+    display_time = _format_fixed_width_column(display_time, VERSION_TIME_COLUMN_WIDTH)
+    author = _format_fixed_width_column(version.author or '-', VERSION_AUTHOR_COLUMN_WIDTH)
+    message = _format_fixed_width_column(version.message or 'update', VERSION_MESSAGE_COLUMN_WIDTH)
+    uid = _format_fixed_width_column(version.uid[:8] or '-', VERSION_UID_COLUMN_WIDTH)
+    return global_number, display_time, author, uid, message
+
+
+def _format_version_choice_label(version: DiffVersionInfo) -> str:
+    global_number, display_time, author, uid, message = _format_version_choice_parts(version)
+    return f'{global_number} | {display_time} | {author} | {uid} | {message}'
 
 
 def _render_version_page(page_versions: list[DiffVersionInfo], prompt: str) -> OrderedDict[str, DiffVersionInfo]:
     choice_map = _build_version_choice_map(page_versions)
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style='bold cyan')
-    table.add_column('#', style='bold yellow', justify='right', width=5)
-    table.add_column('Time', style='green', min_width=20)
-    table.add_column('Author', style='magenta', min_width=10)
-    table.add_column('Version', style='cyan', width=10)
-    table.add_column('Message', style='white')
-
-    for label, version in choice_map.items():
-        label_parts = version.label.split(' | ')
-        time_part = label_parts[0] if len(label_parts) > 0 else version.dt
-        uid_part = label_parts[1] if len(label_parts) > 1 else version.uid[:8]
-        author = version.author or '-'
-        message = version.message or (label_parts[-1] if len(label_parts) > 2 else 'update')
-        global_number = str((version.index + 1) if version.index is not None else '-')
-        table.add_row(global_number, time_part, author, uid_part, message)
-
-    console.print(prompt, style='bold yellow')
-    console.print(table)
     return choice_map
 
 
-async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_index: int = 0) -> DiffVersionInfo | None:
+def _build_styled_version_choice(version: DiffVersionInfo, *, is_base: bool = False) -> 'questionary.Choice | None':
+    try:
+        import questionary as _q
+        from prompt_toolkit.formatted_text import FormattedText
+    except Exception:
+        return None
+
+    global_number, time_part, author, uid_part, message = _format_version_choice_parts(version)
+
+    parts: list[tuple[str, str]] = [
+        ('class:yellow', global_number),
+        ('', ' | '),
+        ('class:green', time_part),
+        ('', ' | '),
+        ('class:magenta', author),
+        ('', ' | '),
+        ('class:cyan', uid_part),
+        ('', ' | '),
+        ('', message),
+    ]
+    if is_base:
+        parts.append(('class:base_marker', '  ◀ base'))
+
+    title = FormattedText(parts)
+    value = _format_version_choice_label(version)
+    if is_base:
+        return _q.Choice(title=title, value=value, disabled='base')
+    return _q.Choice(title=title, value=value)
+
+
+def _normalize_diff_action_label(action: str) -> str:
+    normalized = action.strip().lower()
+    if normalized == 'change':
+        return 'changed'
+    if normalized == 'create':
+        return 'created'
+    if normalized == 'delete':
+        return 'deleted'
+    return normalized
+
+
+def _build_styled_file_change_choice(file_action: DiffFileChange) -> 'questionary.Choice | None':
+    try:
+        import questionary as _q
+        from prompt_toolkit.formatted_text import FormattedText
+    except Exception:
+        return None
+
+    action_label = _normalize_diff_action_label(file_action.action)
+    badge_style = {
+        'changed': 'file_change_changed',
+        'created': 'file_change_created',
+        'deleted': 'file_change_deleted',
+    }.get(action_label, 'file_change_other')
+    path_style = {
+        'changed': 'file_change_path_changed',
+        'created': 'file_change_path_created',
+        'deleted': 'file_change_path_deleted',
+    }.get(action_label, 'file_change_path_other')
+    marker = {
+        'changed': '~',
+        'created': '+',
+        'deleted': '-',
+    }.get(action_label, '*')
+    is_selectable = action_label == 'changed' and file_action.inspectable
+    title_parts: list[tuple[str, str]] = [
+        (f'class:{badge_style}', f' {marker} {action_label.upper():<7} '),
+        ('class:file_change_separator', '  '),
+        (f'class:{path_style}', file_action.path),
+    ]
+    if not is_selectable:
+        title_parts.extend([
+            ('class:file_change_separator', '  '),
+            ('class:file_change_note', '[view only]'),
+        ])
+
+    title = FormattedText(title_parts)
+    if not is_selectable:
+        return _q.Choice(title=title, value=file_action.path, disabled=action_label)
+    return _q.Choice(title=title, value=file_action.path)
+
+
+def _format_file_change_prompt(prompt: str, file_actions: list[DiffFileChange]) -> str:
+    if len(file_actions) == 0:
+        return prompt
+
+    lines = [prompt, '']
+    for item in file_actions:
+        action_label = _normalize_diff_action_label(item.action)
+        suffix = '' if action_label == 'changed' and item.inspectable else ' (not selectable)'
+        lines.append(f'  {action_label:<7} | {item.path}{suffix}')
+    return '\n'.join(lines)
+
+
+_VERSION_SELECT_STYLE = None
+try:
+    from prompt_toolkit.styles import Style as _PTStyle
+    _VERSION_SELECT_STYLE = _PTStyle([
+        ('yellow', '#e5c07b'),
+        ('green', '#98c379'),
+        ('magenta', '#c678dd'),
+        ('cyan', '#56b6c2'),
+        ('base_marker', '#e06c75 bold'),
+        ('file_change_changed', '#98c379 bold'),
+        ('file_change_created', '#56b6c2 bold'),
+        ('file_change_deleted', '#e06c75 bold'),
+        ('file_change_other', '#e5c07b bold'),
+        ('file_change_path_changed', '#d9f6c1'),
+        ('file_change_path_created', '#c8eeff'),
+        ('file_change_path_deleted', '#ffccd1'),
+        ('file_change_path_other', '#f6e1a6'),
+        ('file_change_separator', '#7f848e'),
+        ('file_change_note', '#7f848e italic'),
+    ])
+except Exception:
+    pass
+
+
+async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_index: int = 0, base_version: 'DiffVersionInfo | None' = None) -> DiffVersionInfo | None:
     page = 0
     while True:
         page_versions, total_versions = await mirror.list_remote_versions_page(
@@ -376,15 +496,48 @@ async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_in
 
         choice_map = _render_version_page(page_versions, page_prompt)
         choices = list(choice_map.keys())
-        if has_newer:
-            choices.append('Newer versions')
-        if has_older:
-            choices.append('Older versions')
-        choices.append('Back')
 
-        choice_prompt = 'Choose version'
+        styled_choices = [_build_styled_version_choice(v) for v in page_versions]
+        use_styled = all(c is not None for c in styled_choices)
+
+        # Prepend base version as a disabled highlighted entry
+        base_styled_choice = None
+        if base_version is not None and use_styled:
+            base_styled_choice = _build_styled_version_choice(base_version, is_base=True)
+
+        nav_choices: list[str] = []
+        if has_newer:
+            nav_choices.append('Newer versions')
+        if has_older:
+            nav_choices.append('Older versions')
+        nav_choices.append('Back')
+
+        if use_styled:
+            try:
+                import questionary as _q
+                base_prefix = [base_styled_choice] if base_styled_choice is not None else []
+                all_styled = base_prefix + list(styled_choices) + [_q.Choice(title=nav, value=nav) for nav in nav_choices]
+            except Exception:
+                use_styled = False
+
         default_choice = next(reversed(choice_map)) if len(choice_map) > 0 else 'Back'
-        choice = prompt_choice(choice_prompt, choices, default=default_choice)
+
+        # For fallback mode, show base version in the prompt
+        display_prompt = page_prompt
+        if base_version is not None and not use_styled:
+            base_label = _format_version_choice_label(base_version)
+            display_prompt = f'{page_prompt}\n  ◀ base: {base_label}'
+
+        if use_styled:
+            choice = prompt_choice(
+                page_prompt, choices + nav_choices,
+                default=default_choice,
+                styled_choices=all_styled,
+                style=_VERSION_SELECT_STYLE,
+            )
+        else:
+            choice = prompt_choice(display_prompt, choices + nav_choices, default=default_choice)
+
         if choice == 'Back':
             return None
         if choice == 'Newer versions':
@@ -422,7 +575,7 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
     if base_version.filename is None:
         raise ValueError('Selected version is missing filename information')
 
-    target_version = await _choose_version_interactively(mirror, 'Choose target version', start_index=base_version.index + 1)
+    target_version = await _choose_version_interactively(mirror, 'Choose target version', start_index=base_version.index + 1, base_version=base_version)
     if target_version is None:
         return
 
@@ -435,13 +588,33 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         return
 
     while True:
-        inspectable_actions = [item for item in file_actions if item.action == 'change']
-        if len(inspectable_actions) == 0:
-            console.print('No changed files available for textual inspection', style='yellow')
-            return
-
+        inspectable_actions = [item for item in file_actions if item.action == 'change' and item.inspectable]
         choice_map = OrderedDict((item.path, item) for item in inspectable_actions)
-        choice = prompt_choice('Choose changed file to inspect', list(choice_map.keys()) + ['Back'])
+        selectable_choices = list(choice_map.keys()) + ['Back']
+        styled_choices = [_build_styled_file_change_choice(item) for item in file_actions]
+        use_styled = all(choice is not None for choice in styled_choices)
+
+        if use_styled:
+            try:
+                import questionary as _q
+                all_styled = list(styled_choices) + [_q.Choice(title='Back', value='Back')]
+                choice = prompt_choice(
+                    'Choose file change to inspect',
+                    selectable_choices,
+                    default='Back' if len(choice_map) == 0 else next(iter(choice_map.keys())),
+                    styled_choices=all_styled,
+                    style=_VERSION_SELECT_STYLE,
+                )
+            except Exception:
+                use_styled = False
+
+        if not use_styled:
+            choice = prompt_choice(
+                _format_file_change_prompt('Choose file change to inspect', file_actions),
+                selectable_choices,
+                default='Back' if len(choice_map) == 0 else next(iter(choice_map.keys())),
+            )
+
         if choice == 'Back':
             return
 
