@@ -4,7 +4,7 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'sshmirror'
-version = '0.1.0'
+version = '0.1.5'
 description = 'SSH directory synchronization library and CLI'
 readme = 'README.md'
 requires-python = '>=3.11'
@@ -36,6 +36,11 @@ dependencies = [
     'questionary',
     'rich',
 ]
+
+[project.urls]
+Homepage = 'https://github.com/FellowCode/sshmirror'
+Repository = 'https://github.com/FellowCode/sshmirror'
+Issues = 'https://github.com/FellowCode/sshmirror/issues'
 
 [project.scripts]
 sshmirror = 'sshmirror.cli:main'

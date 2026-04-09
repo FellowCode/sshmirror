@@ -12,14 +12,14 @@ It can also be used as a lightweight sync workflow for a shared project: multipl
 
 ## Why It Stands Out
 
-- Preview first. Inspect current file changes and version-to-version diffs before syncing.
-- Built for real SSH workflows. Passwords, SSH keys, passphrases, and ssh-agent fallback are supported.
-- Keeps local state. SSHMirror stores version and migration metadata under `.sshmirror/`.
-- Works as a library or a command-line tool.
-- Useful for team workflows. Several developers can work on one project and sync changes through the same remote environment.
-- Optional remote container restart after sync.
+- Preview first. Inspect current file changes and version-to-version diffs before syncing. 🔍
+- Built for real SSH workflows. Passwords, SSH keys, passphrases, and ssh-agent fallback are supported. 🔐
+- Keeps local state. SSHMirror stores version and migration metadata under `.sshmirror/`. 🗂️
+- Works as a library or a command-line tool. 🐍
+- Useful for team workflows. Several developers can work on one project and sync changes through the same remote environment. 🤝
+- Optional remote container restart after sync. 🐳
 
-## Install
+## Install 🚀
 
 ```bash
 pip install sshmirror
@@ -31,7 +31,7 @@ For local development:
 pip install -e .
 ```
 
-## Quick Start
+## Quick Start ⚡
 
 1. Create a config file:
 
@@ -59,7 +59,7 @@ pip install -e .
    sshmirror --test-connection
    ```
 
-## Example Configuration
+## Example Configuration ⚙️
 
 The full example lives in [sshmirror.config.example.yml](sshmirror.config.example.yml).
 
@@ -91,7 +91,7 @@ restart_container:
 
 `restart_container` connects to the Docker host where the container is running. If `host`, `port`, or `user` are not specified there, SSHMirror uses the main connection values.
 
-## CLI Commands
+## CLI Commands 🧰
 
 ```bash
 sshmirror --help
@@ -111,7 +111,7 @@ Main non-interactive flags:
 - `--downgrade` downgrade remote version;
 - `--test-connection` validate SSH access to the remote host and configured Docker host.
 
-## Library Usage
+## Library Usage 📦
 
 ```python
 from sshmirror import SSHMirror, SSHMirrorConfig
@@ -139,7 +139,7 @@ sshmirror/
   sshmirror.config.example.yml
 ```
 
-## Development
+## Development 🛠️
 
 Run tests:
 

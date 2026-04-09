@@ -45,12 +45,14 @@ class DirVersion:
     filemap: 'FileMap'
     uid: str = field(default_factory=lambda: uuid.uuid4().hex)
     author: typing.Optional[str] = None
+    message: str = 'update'
     
     def asdict(self):
         return {
             'dt': self.dt.isoformat(),
             'uid': self.uid,
             'author': self.author,
+            'message': self.message,
             'filemap': self.filemap.asdict()
         }
     
@@ -61,6 +63,8 @@ class DirVersion:
     def from_dict(cls, d: dict):
         d['dt'] = datetime.datetime.fromisoformat(d['dt']).replace(tzinfo=datetime.timezone.utc)
         d['filemap'] = FileMap.from_dict(d['filemap'])
+        if 'message' not in d or not d['message']:
+            d['message'] = 'update'
         return cls(**d)
     
     @classmethod

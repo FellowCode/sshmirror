@@ -24,9 +24,6 @@ def _questionary_available() -> bool:
     if questionary is None or not sys.stdin.isatty() or not sys.stdout.isatty():
         return False
 
-    if os.name == 'nt' and os.environ.get('SSHMIRROR_FORCE_QUESTIONARY') != '1':
-        return False
-
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -97,6 +94,19 @@ def prompt_confirm(prompt: str) -> bool:
         return bool(result)
 
     return _fallback_confirm_prompt(prompt)
+
+
+def prompt_text(prompt: str, default: str = 'update') -> str:
+    result = _questionary_ask(
+        lambda: questionary.text(prompt, default=default),
+        'Interactive questionary input is unavailable, fallback to plain input',
+    )
+    if result is not None:
+        value = result.strip()
+        return value or default
+
+    value = input(f'{prompt} [{default}]: ').strip()
+    return value or default
 
 
 def prompt_discard_files() -> list[str]:

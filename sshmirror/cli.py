@@ -6,16 +6,68 @@ import sys
 
 try:
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
-    from .prompts import prompt_choice, prompt_confirm, prompt_discard_files
+    from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_text
     from .sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from .core.exceptions import UserAbort
     from .core.utils import read_text_file
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
-    from prompts import prompt_choice, prompt_confirm, prompt_discard_files
+    from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_text
     from sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from core.exceptions import UserAbort
     from core.utils import read_text_file
+
+
+DEFAULT_CONFIG_TEMPLATE = """# SSH host or IP address used for the main sync connection.
+host: '127.0.0.1'
+
+# SSH port for the main sync connection.
+port: '22'
+
+# SSH username for the main sync connection.
+username: 'root'
+
+# Optional. If omitted together with password, asyncssh will try the user's default SSH keys / ssh-agent.
+# private_key: '~/.ssh/id_ed25519'
+
+# Optional. Passphrase for the private key above.
+# private_key_passphrase: 'KeyPassphrase'
+
+# Optional. Password-based SSH authentication.
+# password: 'password'
+
+# Local project directory that will be synchronized.
+localdir: '.'
+
+# Remote project directory that will be synchronized.
+remotedir: '/app'
+
+# Optional author label stored in generated sync versions.
+author: user
+
+# Optional. If set, SSHMirror can restart a container after sync.
+# This is useful when the remote directory is mounted into a container and you want changes applied immediately.
+restart_container:
+    # Optional. If omitted, values from the main connection are reused.
+    # host: '127.0.0.1'
+    # port: '22'
+    # user: root
+
+    # Same auth rules as the main connection. If omitted here, values from the main
+    # connection are reused, including the default user key fallback.
+    # private_key: '~/.ssh/id_ed25519'
+    # private_key_passphrase: 'KeyPassphrase'
+    # password: 'password'
+
+    # Optional. Run docker commands with sudo on the Docker host.
+    sudo: true
+
+    # Optional. Needed only when sudo requires a password and SSH auth uses a key.
+    # sudo_password: 'password'
+
+    # Docker container name that should be restarted after sync.
+    container_name: testcontainer
+"""
 
 
 def _is_sshmirror_initialized() -> bool:
@@ -36,29 +88,23 @@ def _has_stashed_changes() -> bool:
     return os.path.exists(STASH_METADATA_FILE)
 
 
-def _create_default_config() -> None:
+def _create_default_config() -> bool:
     config_example_path = 'sshmirror.config.example.yml'
     target_path = 'sshmirror.config.yml'
 
     if os.path.exists(target_path):
         console.print(f'{target_path} already exists', style='yellow')
-        return
+        return False
 
     if os.path.exists(config_example_path):
         with open(target_path, 'w', encoding='utf-8') as f:
             f.write(read_text_file(config_example_path))
     else:
         with open(target_path, 'w', encoding='utf-8') as f:
-            f.write(
-                "host: '127.0.0.1'\n"
-                "port: '22'\n"
-                "username: 'root'\n"
-                "localdir: '.'\n"
-                "remotedir: '/app'\n"
-                "author: user\n"
-            )
+            f.write(DEFAULT_CONFIG_TEMPLATE)
 
     console.print(f'Created {target_path}', style='green')
+    return True
 
 
 def _create_default_ignore() -> None:
@@ -73,7 +119,55 @@ def _create_default_ignore() -> None:
     console.print(f'Created {target_path}', style='green')
 
 
+def _menu_item(label: str, action: str) -> tuple[str, str]:
+    return label, action
+
+
+def _build_interactive_menu_items(
+    *,
+    has_config: bool,
+    has_ignore: bool,
+    initialized: bool,
+    has_stash: bool,
+) -> list[tuple[str, str]]:
+    if not has_config:
+        menu_items: list[tuple[str, str]] = []
+    elif initialized:
+        menu_items = [
+            _menu_item('Pull & Push', 'Pull & Push'),
+            _menu_item('Status', 'Status'),
+            _menu_item('View current changes', 'View current changes'),
+            _menu_item('View version changes', 'View version changes'),
+            _menu_item('Pull only', 'Pull only'),
+            _menu_item('Restore stashed changes', 'Restore stashed changes') if has_stash else _menu_item('Stash changes', 'Stash changes'),
+            _menu_item('Force pull', 'Force pull'),
+            _menu_item('Discard all local changes', 'Discard all local changes'),
+            _menu_item('Discard selected files', 'Discard selected files'),
+            _menu_item('Downgrade remote version', 'Downgrade remote version'),
+            _menu_item('Test connection', 'Test connection'),
+        ]
+    else:
+        menu_items = [
+            _menu_item('Initialization', 'Initialization'),
+            _menu_item('Status', 'Status'),
+            _menu_item('View current changes', 'View current changes'),
+            _menu_item('Restore stashed changes', 'Restore stashed changes') if has_stash else None,
+            _menu_item('Test connection', 'Test connection'),
+        ]
+        menu_items = [item for item in menu_items if item is not None]
+
+    if not has_config:
+        menu_items.insert(0, _menu_item('Create sshmirror.config.yml', 'Create sshmirror.config.yml'))
+    if not has_ignore:
+        insert_at = 1 if not has_config else 0
+        menu_items.insert(insert_at, _menu_item('Create sshmirror.ignore.txt', 'Create sshmirror.ignore.txt'))
+
+    menu_items.append(_menu_item('Exit', 'Exit'))
+    return menu_items
+
+
 def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.exit_requested = False
     while True:
         has_config = _find_default_cli_path('sshmirror.config.yml') is not None
         has_ignore = _find_default_cli_path('sshmirror.ignore.txt') is not None
@@ -85,50 +179,32 @@ def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
 
         if not has_config:
             console.print('SSHMirror config is missing', style='yellow')
-            choices = []
         elif initialized:
             console.print('SSHMirror is initialized', style='green')
-            choices = [
-                'Pull & Push',
-                'Status',
-                'View current changes',
-                'View version changes',
-                'Pull only',
-                'Restore stashed changes' if has_stash else 'Stash changes',
-                'Force pull',
-                'Discard all local changes',
-                'Discard selected files',
-                'Downgrade remote version',
-                'Test connection',
-            ]
         else:
             console.print('SSHMirror is not initialized yet', style='yellow')
-            choices = [
-                'Initialization',
-                'Status',
-                'View current changes',
-                'Restore stashed changes' if has_stash else None,
-                'Test connection',
-            ]
-            choices = [choice for choice in choices if choice is not None]
 
-        if not has_config:
-            choices.insert(0, 'Create sshmirror.config.yml')
-        if not has_ignore:
-            insert_at = 1 if not has_config else 0
-            choices.insert(insert_at, 'Create sshmirror.ignore.txt')
-
-        choices.append('Exit')
-        action = prompt_choice('SSHMirror action:', choices)
+        menu_items = _build_interactive_menu_items(
+            has_config=has_config,
+            has_ignore=has_ignore,
+            initialized=initialized,
+            has_stash=has_stash,
+        )
+        labels = [label for label, _action in menu_items]
+        action_by_label = {label: action for label, action in menu_items}
+        action = action_by_label[prompt_choice('SSHMirror action:', labels)]
 
         if action == 'Create sshmirror.config.yml':
-            _create_default_config()
+            if _create_default_config():
+                args.exit_requested = True
+                return args
             continue
         if action == 'Create sshmirror.ignore.txt':
             _create_default_ignore()
             continue
         if action == 'Exit':
-            raise UserAbort('Cancelled by user')
+            args.exit_requested = True
+            return args
         if action == 'Pull only':
             args.pull = True
         elif action == 'Status':
@@ -176,6 +252,7 @@ def _create_mirror_from_args(args: argparse.Namespace) -> SSHMirror:
 
     if args.config and os.path.exists(args.config):
         callbacks = SSHMirrorCallbacks(confirm=prompt_confirm, choose=prompt_choice)
+        callbacks.text = prompt_text
         return SSHMirror(
             config=SSHMirrorConfig.from_file(
                 args.config,
@@ -254,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
     is_interactive_launch = argv is None and len(sys.argv) == 1
     if is_interactive_launch:
         args = _configure_interactive_args(args)
+        if getattr(args, 'exit_requested', False):
+            return 0
 
     try:
         mirror = _create_mirror_from_args(args)

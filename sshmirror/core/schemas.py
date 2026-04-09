@@ -68,6 +68,7 @@ class DiffVersionInfo(BaseModel):
     label: str
     dt: str
     author: str | None = None
+    message: str | None = None
 
 
 class DiffDetail(BaseModel):

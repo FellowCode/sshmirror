@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import json
+import hashlib
 import yaml
 import typing
 import datetime
@@ -24,14 +25,14 @@ import beartype as bt
 try:
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
     from .core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
-    from .core.filemap import FileMap, DirVersion, Migration, Conflicts
+    from .core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from .core.filewatcher import Filewatcher
     from .core.utils import check_path_is_ignored, clear_n_console_rows, parse_ignore_file, read_text_file, write_text_file_atomic_async
     from .core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
     from core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
-    from core.filemap import FileMap, DirVersion, Migration, Conflicts
+    from core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from core.filewatcher import Filewatcher
     from core.utils import check_path_is_ignored, clear_n_console_rows, parse_ignore_file, read_text_file, write_text_file_atomic_async
     from core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
@@ -84,6 +85,7 @@ class SSHMirror:
     stash_directory = STASH_DIRECTORY
     stash_files_directory = STASH_FILES_DIRECTORY
     stash_metadata_file = STASH_METADATA_FILE
+    default_ignore_filename = 'sshmirror.ignore.txt'
     
     def __init__(self, 
                  config: str | SSHMirrorConfig | None = None, 
@@ -181,16 +183,152 @@ class SSHMirror:
         
         if watch and no_sync:
             raise Exception('Only one of watch and no_sync parameters maybe used')
-                
-        self.ignore_file_path = ignore
-        
-        self.filewatcher = Filewatcher(self.localdir, self.ignore_file_path)
-        
-        FileMap.init(ignore_file_path=ignore)
+
+        self.configured_ignore_path = resolved_config.ignore
+        self.ignore_file_path = None
+
+        self.filewatcher = Filewatcher(self.localdir, None)
+
+        self._refresh_ignore_file_path()
+
+    def _build_local_project_path_candidates(self, path: str) -> list[str]:
+        candidates: list[str] = []
+        if os.path.isabs(path):
+            return [path]
+
+        base_dir = os.path.abspath(self.localdir or '.')
+        candidates.append(os.path.join(base_dir, path))
+        candidates.append(os.path.join(base_dir, '.sshmirror', path))
+        candidates.append(path)
+        return candidates
+
+    def _resolve_ignore_file_path(self) -> str | None:
+        if self.configured_ignore_path:
+            candidates = self._build_local_project_path_candidates(self.configured_ignore_path)
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    return os.path.abspath(candidate)
+            return os.path.abspath(candidates[0])
+
+        for candidate in self._build_local_project_path_candidates(self.default_ignore_filename):
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+
+        return None
+
+    def _refresh_ignore_file_path(self) -> None:
+        self.ignore_file_path = self._resolve_ignore_file_path()
+        self.filewatcher.ignore_file_path = self.ignore_file_path
+        FileMap.init(ignore_file_path=self.ignore_file_path)
+
+    def _get_ignore_sync_target(self) -> tuple[str, str] | None:
+        base_dir = os.path.abspath(self.localdir or '.')
+        if self.ignore_file_path is not None:
+            ignore_path = os.path.abspath(self.ignore_file_path)
+        elif self.configured_ignore_path:
+            ignore_path = os.path.abspath(self._build_local_project_path_candidates(self.configured_ignore_path)[0])
+        else:
+            ignore_path = os.path.join(base_dir, self.default_ignore_filename)
+
+        try:
+            relative_path = os.path.relpath(ignore_path, base_dir)
+        except ValueError:
+            return None
+
+        if relative_path.startswith('..'):
+            return None
+        return relative_path.replace('\\', '/'), ignore_path
+
+    @staticmethod
+    async def _build_local_file_entry(path: str, reference_entry: FileEntry | None = None) -> FileEntry | None:
+        if not os.path.exists(path):
+            return None
+
+        stat_result = os.stat(path)
+        size = int(stat_result.st_size)
+        mtime = int(stat_result.st_mtime_ns)
+        if reference_entry is not None and reference_entry.stat_matches(size, mtime):
+            return FileEntry(md5=reference_entry.md5, size=size, mtime=mtime)
+
+        async with aiofiles.open(path, 'rb') as f:
+            md5 = hashlib.md5(await f.read()).hexdigest()
+        return FileEntry(md5=md5, size=size, mtime=mtime)
+
+    async def _get_remote_file_stat(self, conn: SSHClientConnection, path: str) -> tuple[int, int] | None:
+        remote_path = self._remote_get_abs_path(path)
+        result = await conn.run(
+            f'test -f {shlex.quote(remote_path)} && stat -c "%Y\t%s" {shlex.quote(remote_path)}',
+            check=False,
+        )
+        if result.exit_status != 0 or result.stdout.strip() == '':
+            return None
+
+        mtime, size = result.stdout.strip().split('\t', 1)
+        return int(float(mtime) * 1_000_000_000), int(size)
+
+    async def _download_remote_file_to_path(
+        self,
+        conn: SSHClientConnection,
+        remote_relative_path: str,
+        local_path: str,
+        mtime_ns: int | None = None,
+    ) -> None:
+        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        async with conn.start_sftp_client() as sftp:
+            await sftp.get(self._remote_get_abs_path(remote_relative_path), local_path)
+        if mtime_ns is not None:
+            os.utime(local_path, ns=(mtime_ns, mtime_ns))
+
+    async def _sync_ignore_file_before_transfer(self, conn: SSHClientConnection) -> None:
+        self._refresh_ignore_file_path()
+        ignore_target = self._get_ignore_sync_target()
+        if ignore_target is None:
+            return
+        ignore_sync_path, local_ignore_path = ignore_target
+
+        remote_stat = await self._get_remote_file_stat(conn, ignore_sync_path)
+        if remote_stat is None:
+            return
+
+        remote_mtime_ns, _remote_size = remote_stat
+        local_exists = os.path.exists(local_ignore_path)
+        local_mtime_ns = int(os.stat(local_ignore_path).st_mtime_ns) if local_exists else -1
+        if local_exists and remote_mtime_ns <= local_mtime_ns:
+            return
+
+        prevstate = await self._load_prevstate()
+        prevstate_entry = prevstate.get_file(ignore_sync_path) if prevstate is not None else None
+        local_entry = await self._build_local_file_entry(local_ignore_path, prevstate_entry) if local_exists else None
+        has_local_conflict = local_entry is not None and (
+            prevstate_entry is None or not FileMap._entries_equal(local_entry, prevstate_entry)
+        )
+
+        if has_local_conflict:
+            conflicts = Conflicts(remote_version_uid='ignore-file-sync', files=[ignore_sync_path], dirs=[])
+            await self._resolve_conflicts(conflicts)
+
+        await self._download_remote_file_to_path(conn, ignore_sync_path, local_ignore_path, mtime_ns=remote_mtime_ns)
+        self._refresh_ignore_file_path()
+        if not has_local_conflict:
+            console.print(f'Updated ignore config from remote: {ignore_sync_path}', style='yellow')
+            return
+
+        raise UserAbort('Resolve ignore file conflict and retry sync')
 
     @staticmethod
     def _format_version_label(version: DirVersion) -> str:
-        return f'{version.dt.isoformat()} | {version.uid[:8]}'
+        message = (version.message or 'update').strip() or 'update'
+        return f'{version.dt.isoformat()} | {version.uid[:8]} | {message}'
+
+    @staticmethod
+    def _normalize_version_message(message: str | None) -> str:
+        normalized = (message or '').strip()
+        return normalized or 'update'
+
+    def _prompt_version_message(self) -> str:
+        if self.callbacks.text is None:
+            return 'update'
+        return self._normalize_version_message(self.callbacks.text('Version description', 'update'))
 
     def _confirm(self, message: str, abort_message: str) -> bool:
         if self.callbacks.confirm is None:
@@ -521,7 +659,7 @@ class SSHMirror:
             versions = await self._get_remote_versions_stack(conn)
 
         return [
-            DiffVersionInfo(uid=version.uid, label=self._format_version_label(version), dt=version.dt.isoformat(), author=version.author)
+            DiffVersionInfo(uid=version.uid, label=self._format_version_label(version), dt=version.dt.isoformat(), author=version.author, message=version.message)
             for version in versions
         ]
 
@@ -685,6 +823,17 @@ class SSHMirror:
             auth_kwargs=self._get_restart_container_auth_kwargs(),
         )
 
+    def _restart_container_uses_main_connection(self) -> bool:
+        if self.restart_container is None:
+            return False
+
+        restart_connect_kwargs = self._get_restart_container_connect_kwargs()
+        return (
+            restart_connect_kwargs['host'] == self.host
+            and restart_connect_kwargs['port'] == self.port
+            and restart_connect_kwargs['username'] == self.username
+        )
+
     def _build_restart_container_docker_cmd(self, docker_subcommand: str) -> str:
         if self.restart_container is None:
             raise ValueError('restart_container is not configured')
@@ -737,7 +886,7 @@ class SSHMirror:
                 raise RuntimeError(f'remote host check failed: {stderr}')
             console.print('Remote host connection ok', style='green')
 
-        if self.restart_container is not None:
+        if self.restart_container is not None and not self._restart_container_uses_main_connection():
             await self._test_restart_container()
         
     async def _load_or_create_prevstate(self) -> FileMap:
@@ -832,6 +981,7 @@ class SSHMirror:
         await self._save_stash_metadata(migration, base_filemap)
 
     async def stash_changes(self):
+        self._refresh_ignore_file_path()
         if _has_stashed_changes():
             console.print('Stashed changes already exist. Restore them before creating a new stash.', style='yellow')
             return
@@ -858,6 +1008,7 @@ class SSHMirror:
         console.print('Local changes stashed and project synced from remote', style='green')
 
     async def restore_stash(self):
+        self._refresh_ignore_file_path()
         if not _has_stashed_changes():
             console.print('No stashed changes found', style='yellow')
             return
@@ -916,6 +1067,7 @@ class SSHMirror:
         console.print('Stashed changes restored', style='green')
 
     async def status(self):
+        self._refresh_ignore_file_path()
         console.print('Status', style='green bold')
         console.print(f'  initialized: {_is_sshmirror_initialized()}', style='cyan')
         console.print(f'  stash: {_has_stashed_changes()}', style='cyan')
@@ -966,6 +1118,7 @@ class SSHMirror:
             live_diff.print_actions(prefix='  diff > ')
             
     async def run(self):
+        self._refresh_ignore_file_path()
         console.print('Connect to remote...', style='yellow')
         async with asyncssh.connect(**self._build_connect_kwargs(
             host=self.host,
@@ -984,6 +1137,8 @@ class SSHMirror:
             if not await self._validate_conflicts():
                 return 
             clear_n_console_rows(1)
+
+            await self._sync_ignore_file_before_transfer(conn)
             
             console.print('Look local changes...', style='yellow')
             prevstate = await self._load_or_create_prevstate()
@@ -1137,6 +1292,9 @@ class SSHMirror:
                     
             
     async def force_pull(self, require_confirm: bool = True):
+        self._refresh_ignore_file_path()
+        if not await self._validate_conflicts():
+            return
         if require_confirm:
             if not self._confirm(
                 'WARNING! This operation cleans all your changes. Overwrite local files from remote?',
@@ -1150,6 +1308,7 @@ class SSHMirror:
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
+            await self._sync_ignore_file_before_transfer(conn)
             clear_n_console_rows(1)
             console.print('Get local and remote versions...', style='yellow')
             local_versions, remote_versions = await asyncio.gather(self._get_local_versions_stack(), self._get_remote_versions_stack(conn))
@@ -1190,7 +1349,7 @@ class SSHMirror:
         not_found: list[str] = []
         async def copy(src: str, dst: str):
             try:
-                await aioshutil.copy(file, dst)
+                await aioshutil.copy(src, dst)
                 copied.append(dst)
             except FileNotFoundError:
                 conflicts.remove(src)
@@ -1279,6 +1438,8 @@ class SSHMirror:
         
         if not self._confirm('Apply push changes?', 'Push cancelled by user'):
             raise UserAbort('Push cancelled by user')
+
+        local_version.message = self._prompt_version_message()
             
         clear_n_console_rows(len(migration.actions) + 2)
         
@@ -1371,7 +1532,7 @@ class SSHMirror:
         return DirVersion.loads(s)
     
     def _create_version(self, filemap: FileMap):
-        return DirVersion(dt=datetime.datetime.now(datetime.timezone.utc), author=self.author, filemap=filemap)
+        return DirVersion(dt=datetime.datetime.now(datetime.timezone.utc), author=self.author, message='update', filemap=filemap)
     
     async def _save_version(self, v: DirVersion, ignore_error=False) -> str:
         path = os.path.join(self.versions_directory, v.filename())
@@ -1456,7 +1617,7 @@ class SSHMirror:
 
     async def _get_remote_map(self, conn: SSHClientConnection, reference_map: FileMap | None = None) -> FileMap:
         ignore_list = parse_ignore_file(self.ignore_file_path)
-        exclude_cmd = '-regextype posix-extended ' + ' '.join([f"! -regex '{self.remotedir}{ignored.pattern}'" for ignored in ignore_list])
+        exclude_cmd = ''
         cmd_files = f"find {self.remotedir} {exclude_cmd} -type f -printf '%P\\t%s\\t%T@\\n'"
         cmd_dirs = f"find {self.remotedir} {exclude_cmd} -type d -printf '%P\\n'"
         result_files, result_dirs = await asyncio.gather(conn.run(cmd_files), conn.run(cmd_dirs))
