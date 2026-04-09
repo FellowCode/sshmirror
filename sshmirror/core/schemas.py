@@ -61,6 +61,7 @@ class MigrationChanges(BaseModel):
 class DiffFileChange(BaseModel):
     action: str
     path: str
+    inspectable: bool = True
 
 
 class DiffVersionInfo(BaseModel):

@@ -287,13 +287,20 @@ async def _show_current_changes_cli(mirror: SSHMirror) -> None:
         return
 
     while True:
-        choice_map = {f'{item.action} {item.path}': item for item in file_actions}
-        choice = prompt_choice('Choose current file change to inspect', list(choice_map.keys()) + ['Back'])
+        inspectable_actions = [item for item in file_actions if item.action == 'change' and item.inspectable]
+        if len(inspectable_actions) == 0:
+            console.print('No changed files available for textual inspection', style='yellow')
+            return
+
+        choice_map = OrderedDict((item.path, item) for item in inspectable_actions)
+        choice = prompt_choice('Choose changed file to inspect', list(choice_map.keys()) + ['Back'])
         if choice == 'Back':
             return
 
         detail = await mirror.get_current_change_detail(choice_map[choice].path)
         mirror.render_diff_detail(detail)
+        prompt_choice('Diff actions', ['Back'], default='Back')
+        console.clear()
 
 
 def _build_version_page_choices(total_versions: int, page: int, page_size: int = VERSION_PAGE_SIZE) -> tuple[bool, bool, int]:
@@ -316,25 +323,35 @@ def _format_version_page_prompt(prompt: str, page: int, total_versions: int, pag
 
 
 def _build_version_choice_map(page_versions: list[DiffVersionInfo]) -> OrderedDict[str, DiffVersionInfo]:
-    return OrderedDict((str(index), version) for index, version in enumerate(page_versions, start=1))
+    return OrderedDict((_format_version_choice_label(version), version) for version in page_versions)
+
+
+def _format_version_choice_label(version: DiffVersionInfo) -> str:
+    global_number = (version.index + 1) if version.index is not None else 0
+    author = version.author or '-'
+    message = version.message or 'update'
+    uid = version.uid[:8]
+    display_time = version.label.split(' | ')[0] if ' | ' in version.label else version.dt
+    return f'{global_number:>5} | {display_time} | {author} | {uid} | {message}'
 
 
 def _render_version_page(page_versions: list[DiffVersionInfo], prompt: str) -> OrderedDict[str, DiffVersionInfo]:
     choice_map = _build_version_choice_map(page_versions)
     table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style='bold cyan')
-    table.add_column('#', style='bold yellow', justify='right', width=3)
+    table.add_column('#', style='bold yellow', justify='right', width=5)
     table.add_column('Time', style='green', min_width=20)
     table.add_column('Author', style='magenta', min_width=10)
     table.add_column('Version', style='cyan', width=10)
     table.add_column('Message', style='white')
 
-    for number, version in choice_map.items():
+    for label, version in choice_map.items():
         label_parts = version.label.split(' | ')
         time_part = label_parts[0] if len(label_parts) > 0 else version.dt
         uid_part = label_parts[1] if len(label_parts) > 1 else version.uid[:8]
         author = version.author or '-'
         message = version.message or (label_parts[-1] if len(label_parts) > 2 else 'update')
-        table.add_row(number, time_part, author, uid_part, message)
+        global_number = str((version.index + 1) if version.index is not None else '-')
+        table.add_row(global_number, time_part, author, uid_part, message)
 
     console.print(prompt, style='bold yellow')
     console.print(table)
@@ -365,8 +382,9 @@ async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_in
             choices.append('Older versions')
         choices.append('Back')
 
-        choice_prompt = 'Choose version number'
-        choice = prompt_choice(choice_prompt, choices)
+        choice_prompt = 'Choose version'
+        default_choice = next(reversed(choice_map)) if len(choice_map) > 0 else 'Back'
+        choice = prompt_choice(choice_prompt, choices, default=default_choice)
         if choice == 'Back':
             return None
         if choice == 'Newer versions':
@@ -417,8 +435,13 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         return
 
     while True:
-        choice_map = {f'{item.action} {item.path}': item for item in file_actions}
-        choice = prompt_choice('Choose file change to inspect', list(choice_map.keys()) + ['Back'])
+        inspectable_actions = [item for item in file_actions if item.action == 'change']
+        if len(inspectable_actions) == 0:
+            console.print('No changed files available for textual inspection', style='yellow')
+            return
+
+        choice_map = OrderedDict((item.path, item) for item in inspectable_actions)
+        choice = prompt_choice('Choose changed file to inspect', list(choice_map.keys()) + ['Back'])
         if choice == 'Back':
             return
 
@@ -430,6 +453,8 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
             choice_map[choice].path,
         )
         mirror.render_diff_detail(detail)
+        prompt_choice('Diff actions', ['Back'], default='Back')
+        console.clear()
 
 
 def main(argv: list[str] | None = None) -> int:

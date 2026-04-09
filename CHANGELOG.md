@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.12
+
+### Fixed
+
+- Fixed `Ctrl+C` handling in interactive menus so cancellation exits cleanly instead of falling back to plain input.
+- Fixed prompt cancellation handling for both `questionary` prompts and plain-input fallback paths.
+
+## 0.1.11
+
+### Changed
+
+- Finalized interactive diff browsing so version pages open with the newest item on the current page selected by default.
+- Restricted textual diff inspection to inspectable changed files only.
+
+### Fixed
+
+- Prevented oversized changed files from being selectable in interactive diff views.
+
 ## 0.1.10
 
 ### Changed

@@ -12,13 +12,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
-from sshmirror.cli import _build_interactive_menu_items, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_page_prompt, _render_version_page, _show_version_changes_cli, build_parser
+from sshmirror.cli import _build_interactive_menu_items, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, build_parser
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
 from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo
 from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
-from sshmirror.prompts import _questionary_available
+from sshmirror.prompts import _questionary_available, prompt_choice, prompt_confirm
 
 
 @contextmanager
@@ -184,12 +184,12 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
     def test_choose_version_interactively_supports_pagination(self):
         versions_page_1 = [
-            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index)
-            for index in range(24, 4, -1)
+            DiffVersionInfo(uid=str(index), label=f'2026-04-09 12:{index:02d}:00 UTC | {index:08d} | user | msg-{index}', dt=f'dt-{index}', index=index)
+            for index in range(5, 25)
         ]
         versions_page_2 = [
-            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index)
-            for index in range(4, -1, -1)
+            DiffVersionInfo(uid=str(index), label=f'2026-04-09 11:{index:02d}:00 UTC | {index:08d} | user | msg-{index}', dt=f'dt-{index}', index=index)
+            for index in range(0, 5)
         ]
         mirror = Mock()
         mirror.list_remote_versions_page = AsyncMock(side_effect=[
@@ -197,37 +197,63 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             (versions_page_2, 25),
         ])
 
-        with patch('sshmirror.cli.prompt_choice', side_effect=['Older versions', '4']) as prompt_mock:
+        with patch('sshmirror.cli.prompt_choice', side_effect=['Older versions', _format_version_choice_label(versions_page_2[1])]) as prompt_mock:
             selected = asyncio.run(_choose_version_interactively(mirror, 'Choose base version'))
 
         self.assertIsNotNone(selected)
         self.assertEqual(selected.uid, '1')
         self.assertEqual(mirror.list_remote_versions_page.await_count, 2)
-        self.assertEqual(prompt_mock.call_args_list[0].args[0], 'Choose version number')
+        self.assertEqual(prompt_mock.call_args_list[0].args[0], 'Choose version')
+        self.assertEqual(prompt_mock.call_args_list[0].kwargs['default'], _format_version_choice_label(versions_page_1[-1]))
+
+    def test_version_choice_label_uses_five_digit_global_number(self):
+        version = DiffVersionInfo(
+            uid='1234567890abcdef',
+            label='2026-04-09 12:34:56 UTC | 12345678 | user | msg',
+            dt='2026-04-09 12:34:56 UTC',
+            index=12344,
+        )
+
+        self.assertEqual(
+            _format_version_choice_label(version),
+            '12345 | 2026-04-09 12:34:56 UTC | - | 12345678 | update',
+        )
 
     def test_show_version_changes_cli_uses_paginated_version_selection(self):
         versions_first_page = [
-            DiffVersionInfo(uid=str(index), label=f'version-{index}', dt=f'dt-{index}', index=index, filename=f'version-{index}.json')
-            for index in range(24, 4, -1)
+            DiffVersionInfo(uid=str(index), label=f'2026-04-09 12:{index:02d}:00 UTC | {index:08d} | user | msg-{index}', dt=f'dt-{index}', index=index, filename=f'version-{index}.json')
+            for index in range(5, 25)
         ]
         versions_target_page = [
-            DiffVersionInfo(uid='11', label='version-11', dt='dt-11', index=11, filename='version-11.json'),
-            DiffVersionInfo(uid='10', label='version-10', dt='dt-10', index=10, filename='version-10.json'),
-            DiffVersionInfo(uid='9', label='version-9', dt='dt-9', index=9, filename='version-9.json'),
-            DiffVersionInfo(uid='8', label='version-8', dt='dt-8', index=8, filename='version-8.json'),
-            DiffVersionInfo(uid='7', label='version-7', dt='dt-7', index=7, filename='version-7.json'),
-            DiffVersionInfo(uid='6', label='version-6', dt='dt-6', index=6, filename='version-6.json'),
-            DiffVersionInfo(uid='5', label='version-5', dt='dt-5', index=5, filename='version-5.json'),
+            DiffVersionInfo(uid='10', label='2026-04-09 12:10:00 UTC | 00000010 | user | msg-10', dt='dt-10', index=10, filename='version-10.json'),
+            DiffVersionInfo(uid='11', label='2026-04-09 12:11:00 UTC | 00000011 | user | msg-11', dt='dt-11', index=11, filename='version-11.json'),
+            DiffVersionInfo(uid='12', label='2026-04-09 12:12:00 UTC | 00000012 | user | msg-12', dt='dt-12', index=12, filename='version-12.json'),
+            DiffVersionInfo(uid='13', label='2026-04-09 12:13:00 UTC | 00000013 | user | msg-13', dt='dt-13', index=13, filename='version-13.json'),
+            DiffVersionInfo(uid='14', label='2026-04-09 12:14:00 UTC | 00000014 | user | msg-14', dt='dt-14', index=14, filename='version-14.json'),
+            DiffVersionInfo(uid='15', label='2026-04-09 12:15:00 UTC | 00000015 | user | msg-15', dt='dt-15', index=15, filename='version-15.json'),
+            DiffVersionInfo(uid='16', label='2026-04-09 12:16:00 UTC | 00000016 | user | msg-16', dt='dt-16', index=16, filename='version-16.json'),
+            DiffVersionInfo(uid='17', label='2026-04-09 12:17:00 UTC | 00000017 | user | msg-17', dt='dt-17', index=17, filename='version-17.json'),
+            DiffVersionInfo(uid='18', label='2026-04-09 12:18:00 UTC | 00000018 | user | msg-18', dt='dt-18', index=18, filename='version-18.json'),
+            DiffVersionInfo(uid='19', label='2026-04-09 12:19:00 UTC | 00000019 | user | msg-19', dt='dt-19', index=19, filename='version-19.json'),
+            DiffVersionInfo(uid='20', label='2026-04-09 12:20:00 UTC | 00000020 | user | msg-20', dt='dt-20', index=20, filename='version-20.json'),
+            DiffVersionInfo(uid='21', label='2026-04-09 12:21:00 UTC | 00000021 | user | msg-21', dt='dt-21', index=21, filename='version-21.json'),
+            DiffVersionInfo(uid='22', label='2026-04-09 12:22:00 UTC | 00000022 | user | msg-22', dt='dt-22', index=22, filename='version-22.json'),
+            DiffVersionInfo(uid='23', label='2026-04-09 12:23:00 UTC | 00000023 | user | msg-23', dt='dt-23', index=23, filename='version-23.json'),
+            DiffVersionInfo(uid='24', label='2026-04-09 12:24:00 UTC | 00000024 | user | msg-24', dt='dt-24', index=24, filename='version-24.json'),
         ]
-        file_changes = [DiffFileChange(action='change', path='src/app.py')]
+        file_changes = [
+            DiffFileChange(action='change', path='src/app.py'),
+            DiffFileChange(action='create', path='src/new.py'),
+            DiffFileChange(action='delete', path='src/old.py'),
+        ]
         mirror = Mock()
         mirror.list_remote_versions_page = AsyncMock(side_effect=[
             (versions_first_page, 25),
             (versions_first_page, 25),
-            (versions_target_page, 7),
+            (versions_target_page, 15),
         ])
         mirror.list_version_changes_by_filenames = AsyncMock(return_value=file_changes)
-        mirror.get_version_change_detail_by_filenames = AsyncMock(
+        mirror.get_version_change_detail_by_range = AsyncMock(
             return_value=DiffDetail(
                 path='src/app.py',
                 action='change',
@@ -239,22 +265,95 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         )
         mirror.render_diff_detail = Mock()
 
-        with patch('sshmirror.cli.prompt_choice', side_effect=['16', '1', 'Back']):
+        with patch(
+            'sshmirror.cli.prompt_choice',
+            side_effect=[
+                _format_version_choice_label(versions_first_page[4]),
+                _format_version_choice_label(versions_target_page[5]),
+                'src/app.py',
+                'Back',
+                'Back',
+            ],
+        ):
             asyncio.run(_show_version_changes_cli(mirror))
 
-        mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-9.json', 'version-11.json')
-        mirror.get_version_change_detail_by_filenames.assert_not_awaited()
+        mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-9.json', 'version-15.json')
+        mirror.get_version_change_detail_by_range.assert_awaited_once_with('version-9.json', 'version-15.json', 9, 15, 'src/app.py')
+
+    def test_file_inspection_choice_offers_only_changed_files_and_back(self):
+        base_versions_page = [
+            DiffVersionInfo(uid='1', label='2026-04-09 12:01:00 UTC | 00000001 | user | msg-1', dt='dt-1', index=1, filename='version-1.json'),
+            DiffVersionInfo(uid='2', label='2026-04-09 12:02:00 UTC | 00000002 | user | msg-2', dt='dt-2', index=2, filename='version-2.json'),
+        ]
+        target_versions_page = [
+            DiffVersionInfo(uid='2', label='2026-04-09 12:02:00 UTC | 00000002 | user | msg-2', dt='dt-2', index=2, filename='version-2.json'),
+        ]
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(side_effect=[
+            (base_versions_page, 3),
+            (base_versions_page, 3),
+            (target_versions_page, 1),
+        ])
+        mirror.list_version_changes_by_filenames = AsyncMock(return_value=[
+            DiffFileChange(action='change', path='src/app.py'),
+            DiffFileChange(action='create', path='src/new.py'),
+        ])
+        mirror.get_version_change_detail_by_range = AsyncMock(return_value=DiffDetail(
+            path='src/app.py',
+            action='change',
+            before_label='before',
+            after_label='after',
+            before_text='old',
+            after_text='new',
+        ))
+        mirror.render_diff_detail = Mock()
+
+        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(base_versions_page[0]), _format_version_choice_label(target_versions_page[0]), 'src/app.py', 'Back', 'Back']) as prompt_mock, \
+             patch('sshmirror.cli.console.clear') as clear_mock:
+            asyncio.run(_show_version_changes_cli(mirror))
+
+        file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[0] == 'Choose changed file to inspect')
+        self.assertEqual(file_prompt_call.args[1], ['src/app.py', 'Back'])
+        clear_mock.assert_called_once()
+
+    def test_current_changes_cli_skips_large_changed_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = Mock()
+                mirror.list_current_changes = AsyncMock(return_value=[
+                    DiffFileChange(action='change', path='src/large.bin', inspectable=False),
+                    DiffFileChange(action='change', path='src/app.py', inspectable=True),
+                    DiffFileChange(action='create on server', path='src/new.py', inspectable=False),
+                ])
+                mirror.get_current_change_detail = AsyncMock(return_value=DiffDetail(
+                    path='src/app.py',
+                    action='change',
+                    before_label='before',
+                    after_label='after',
+                    before_text='old',
+                    after_text='new',
+                ))
+                mirror.render_diff_detail = Mock()
+
+                with patch('sshmirror.cli.prompt_choice', side_effect=['src/app.py', 'Back', 'Back']) as prompt_mock, \
+                     patch('sshmirror.cli.console.clear') as clear_mock:
+                    asyncio.run(_show_current_changes_cli(mirror))
+
+                file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[0] == 'Choose changed file to inspect')
+                self.assertEqual(file_prompt_call.args[1], ['src/app.py', 'Back'])
+                clear_mock.assert_called_once()
 
     def test_build_version_choice_map_uses_numeric_shortcuts(self):
         page_versions = [
-            DiffVersionInfo(uid='a', label='version-a', dt='dt-a'),
-            DiffVersionInfo(uid='b', label='version-b', dt='dt-b'),
+            DiffVersionInfo(uid='a', label='2026-04-09 12:01:00 UTC | abcdef12 | alice | first', dt='dt-a', index=122, author='alice', message='first'),
+            DiffVersionInfo(uid='b', label='2026-04-09 12:02:00 UTC | bcdef123 | bob | second', dt='dt-b', index=123, author='bob', message='second'),
         ]
 
         choice_map = _build_version_choice_map(page_versions)
 
-        self.assertEqual(list(choice_map.keys()), ['1', '2'])
-        self.assertEqual(choice_map['2'].uid, 'b')
+        self.assertEqual(list(choice_map.keys())[0], '  123 | 2026-04-09 12:01:00 UTC | alice | a | first')
+        self.assertEqual(list(choice_map.keys())[1], '  124 | 2026-04-09 12:02:00 UTC | bob | b | second')
 
     def test_render_version_page_displays_author_column(self):
         page_versions = [
@@ -519,9 +618,36 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         with patch('sshmirror.prompts.questionary', object()), \
              patch('sshmirror.prompts.os.name', 'nt'), \
              patch('sys.stdin.isatty', return_value=True), \
-             patch('sys.stdout.isatty', return_value=True), \
-             patch('sshmirror.prompts.asyncio.get_running_loop', side_effect=RuntimeError):
+             patch('sys.stdout.isatty', return_value=True):
             self.assertTrue(_questionary_available())
+
+    def test_questionary_remains_available_during_running_event_loop(self):
+        with patch('sshmirror.prompts.questionary', object()), \
+             patch('sys.stdin.isatty', return_value=True), \
+             patch('sys.stdout.isatty', return_value=True), \
+             patch('sshmirror.prompts.asyncio.get_running_loop', return_value=object()):
+            self.assertTrue(_questionary_available())
+
+    def test_prompt_choice_treats_questionary_none_as_user_abort(self):
+        question = Mock()
+        question.ask.return_value = None
+        questionary_mock = Mock()
+        questionary_mock.select.return_value = question
+
+        with patch('sshmirror.prompts.questionary', questionary_mock), \
+             patch('sys.stdin.isatty', return_value=True), \
+             patch('sys.stdout.isatty', return_value=True), \
+             patch('builtins.input') as input_mock:
+            with self.assertRaises(UserAbort):
+                prompt_choice('Choose', ['one', 'two'])
+
+        input_mock.assert_not_called()
+
+    def test_fallback_confirm_ctrl_c_raises_user_abort(self):
+        with patch('sshmirror.prompts.questionary', None), \
+             patch('builtins.input', side_effect=KeyboardInterrupt):
+            with self.assertRaises(UserAbort):
+                prompt_confirm('Proceed?')
 
     def test_interactive_menu_uses_plain_labels(self):
         menu_items = _build_interactive_menu_items(

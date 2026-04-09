@@ -554,8 +554,28 @@ class SSHMirror:
     @staticmethod
     def _build_file_actions(migration: MigrationChanges | Migration, created_action: str, deleted_action: str) -> list[DiffFileChange]:
         actions = [DiffFileChange(action='change', path=path) for path in migration.files.changed]
-        actions += [DiffFileChange(action=created_action, path=path) for path in migration.files.created]
-        actions += [DiffFileChange(action=deleted_action, path=path) for path in migration.files.deleted]
+        actions += [DiffFileChange(action=created_action, path=path, inspectable=False) for path in migration.files.created]
+        actions += [DiffFileChange(action=deleted_action, path=path, inspectable=False) for path in migration.files.deleted]
+        return actions
+
+    def _build_file_actions_with_entries(
+        self,
+        migration: MigrationChanges | Migration,
+        before_map: FileMap,
+        after_map: FileMap,
+        created_action: str,
+        deleted_action: str,
+    ) -> list[DiffFileChange]:
+        actions = [
+            DiffFileChange(
+                action='change',
+                path=path,
+                inspectable=not self._is_large_diff_file(before_map.get_file(path), after_map.get_file(path)),
+            )
+            for path in migration.files.changed
+        ]
+        actions += [DiffFileChange(action=created_action, path=path, inspectable=False) for path in migration.files.created]
+        actions += [DiffFileChange(action=deleted_action, path=path, inspectable=False) for path in migration.files.deleted]
         return actions
 
     @staticmethod
@@ -601,7 +621,13 @@ class SSHMirror:
             remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
 
         migration = local_state.migrate_to(remote_map)
-        return self._build_file_actions(migration, created_action='create on server', deleted_action='delete on server')
+        return self._build_file_actions_with_entries(
+            migration,
+            local_state,
+            remote_map,
+            created_action='create on server',
+            deleted_action='delete on server',
+        )
 
     async def get_current_change_detail(self, path: str) -> DiffDetail:
         prevstate = await self._load_prevstate()
@@ -722,7 +748,6 @@ class SSHMirror:
                 )
             )
 
-        page_infos.reverse()
         return page_infos, total_versions
 
     async def list_version_changes(self, base_version_uid: str, target_version_uid: str) -> list[DiffFileChange]:
@@ -753,7 +778,13 @@ class SSHMirror:
             raise ValueError(f'Unknown target version uid {target_version_uid}')
 
         migration = base_version.filemap.migrate_to(target_version.filemap)
-        return self._build_file_actions(migration, created_action='create', deleted_action='delete')
+        return self._build_file_actions_with_entries(
+            migration,
+            base_version.filemap,
+            target_version.filemap,
+            created_action='create',
+            deleted_action='delete',
+        )
 
     async def list_version_changes_by_filenames(self, base_filename: str, target_filename: str) -> list[DiffFileChange]:
         async with asyncssh.connect(**self._build_connect_kwargs(
@@ -765,7 +796,13 @@ class SSHMirror:
             base_version, target_version = await self._load_remote_versions_by_filenames(conn, [base_filename, target_filename])
 
         migration = base_version.filemap.migrate_to(target_version.filemap)
-        return self._build_file_actions(migration, created_action='create', deleted_action='delete')
+        return self._build_file_actions_with_entries(
+            migration,
+            base_version.filemap,
+            target_version.filemap,
+            created_action='create',
+            deleted_action='delete',
+        )
 
     async def get_version_change_detail(self, base_version_uid: str, target_version_uid: str, path: str) -> DiffDetail:
         async with asyncssh.connect(**self._build_connect_kwargs(
