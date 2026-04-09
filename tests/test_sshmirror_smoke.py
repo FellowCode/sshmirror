@@ -269,7 +269,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 command = mirror._build_restart_container_docker_cmd('restart')
 
-                self.assertIn('printf %s\\n configured-secret | sudo -S -k docker restart app', command)
+                self.assertIn("printf '%s\\n' configured-secret | sudo -S -k -p '' -- docker restart app", command)
 
     def test_restart_container_prompts_for_sudo_password_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -295,12 +295,101 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 first_command = mirror._build_restart_container_docker_cmd('restart')
                 second_command = mirror._build_restart_container_docker_cmd('inspect --type container')
 
-                self.assertIn('printf %s\\n prompted-secret | sudo -S -k docker restart app', first_command)
+                self.assertIn("printf '%s\\n' prompted-secret | sudo -S -k -p '' -- docker restart app", first_command)
                 self.assertIn(
-                    'printf %s\\n prompted-secret | sudo -S -k docker inspect --type container app',
+                    "printf '%s\\n' prompted-secret | sudo -S -k -p '' -- docker inspect --type container app",
                     second_command,
                 )
                 secret_mock.assert_called_once_with('Sudo password for Docker host')
+
+    def test_restart_container_preserves_leading_and_trailing_spaces_in_prompted_sudo_password(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                secret_mock = Mock(return_value='  padded-secret  ')
+                callbacks = SSHMirrorCallbacks(secret=secret_mock)
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                            'sudo': True,
+                        },
+                    ),
+                    callbacks=callbacks,
+                )
+
+                command = mirror._build_restart_container_docker_cmd('restart')
+
+                self.assertIn("printf '%s\\n' '  padded-secret  ' | sudo -S -k -p '' -- docker restart app", command)
+
+    def test_restart_container_sudo_check_reports_rejected_password(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                callbacks = SSHMirrorCallbacks(secret=lambda _prompt: 'bad-secret')
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                            'sudo': True,
+                        },
+                    ),
+                    callbacks=callbacks,
+                )
+
+                class Result:
+                    def __init__(self, exit_status, stderr='', stdout=''):
+                        self.exit_status = exit_status
+                        self.stderr = stderr
+                        self.stdout = stdout
+
+                dummy_conn = object.__new__(SSHClientConnection)
+                dummy_conn.run = AsyncMock(side_effect=[
+                    Result(0),
+                    Result(1, stderr='Sorry, try again\nsudo: no password was provided'),
+                ])
+
+                with self.assertRaisesRegex(RuntimeError, 'sudo password was rejected or not accepted by sudo'):
+                    asyncio.run(mirror._run_restart_container_diagnostics(dummy_conn))
+
+    def test_restart_container_diagnostics_reports_missing_docker_binary(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                class Result:
+                    def __init__(self, exit_status, stderr='', stdout=''):
+                        self.exit_status = exit_status
+                        self.stderr = stderr
+                        self.stdout = stdout
+
+                dummy_conn = object.__new__(SSHClientConnection)
+                dummy_conn.run = AsyncMock(return_value=Result(1))
+
+                with self.assertRaisesRegex(RuntimeError, 'docker is not installed or is not available in PATH'):
+                    asyncio.run(mirror._run_restart_container_diagnostics(dummy_conn))
 
     def test_cli_help_mentions_docker_host_for_restart_connection(self):
         help_text = build_parser().format_help()

@@ -850,7 +850,7 @@ class SSHMirror:
             return None
 
         provided_password = self.callbacks.secret('Sudo password for Docker host')
-        normalized_password = provided_password.strip()
+        normalized_password = provided_password.rstrip('\r\n')
         if normalized_password:
             self._runtime_restart_sudo_password = normalized_password
             return normalized_password
@@ -861,14 +861,52 @@ class SSHMirror:
             raise ValueError('restart_container is not configured')
 
         docker_cmd = f'docker {docker_subcommand} {shlex.quote(self.restart_container["container_name"])}'
+        return self._wrap_restart_container_command_for_sudo(docker_cmd)
+
+    def _wrap_restart_container_command_for_sudo(self, command: str) -> str:
+        if self.restart_container is None:
+            raise ValueError('restart_container is not configured')
+
         if not self.restart_container.get('sudo', False):
-            return docker_cmd
+            return command
 
         sudo_password = self._get_restart_container_sudo_password()
         if sudo_password:
-            return f'printf %s\\n {shlex.quote(sudo_password)} | sudo -S -k {docker_cmd}'
+            return f"printf '%s\\n' {shlex.quote(sudo_password)} | sudo -S -k -p '' -- {command}"
 
-        return f'sudo -n {docker_cmd}'
+        return f'sudo -n -- {command}'
+
+    @staticmethod
+    def _command_error_text(result) -> str:
+        return result.stderr.strip() or result.stdout.strip() or 'command failed'
+
+    async def _run_restart_container_diagnostics(self, conn: SSHClientConnection) -> None:
+        docker_check = await conn.run('command -v docker >/dev/null 2>&1', check=False)
+        if docker_check.exit_status != 0:
+            raise RuntimeError('restart_container diagnostic failed: docker is not installed or is not available in PATH on the Docker host')
+
+        if not self.restart_container or not self.restart_container.get('sudo', False):
+            return
+
+        sudo_check = await conn.run(self._wrap_restart_container_command_for_sudo('true'), check=False)
+        if sudo_check.exit_status == 0:
+            return
+
+        error_text = self._command_error_text(sudo_check)
+        lowered_error = error_text.lower()
+        if 'sorry, try again' in lowered_error or 'no password was provided' in lowered_error:
+            raise RuntimeError(
+                'restart_container sudo check failed: sudo password was rejected or not accepted by sudo on the Docker host'
+            )
+        if 'a password is required' in lowered_error:
+            raise RuntimeError(
+                'restart_container sudo check failed: sudo requires a password on the Docker host. Set restart_container.sudo_password or use the interactive password prompt.'
+            )
+        if 'tty' in lowered_error:
+            raise RuntimeError(
+                f'restart_container sudo check failed: {error_text}. The Docker host may require a tty for sudo.'
+            )
+        raise RuntimeError(f'restart_container sudo check failed: {error_text}')
 
     async def _test_restart_container(self):
         if self.restart_container is None:
@@ -877,6 +915,9 @@ class SSHMirror:
         console.print('Connect to Docker host...', style='yellow')
         async with asyncssh.connect(**self._get_restart_container_connect_kwargs()) as conn:
             clear_n_console_rows(1)
+            console.print('Run Docker host diagnostics...', style='yellow')
+            await self._run_restart_container_diagnostics(conn)
+            clear_n_console_rows(1)
             console.print('Check docker container...', style='yellow')
             result = await conn.run(
                 self._build_restart_container_docker_cmd('inspect --type container'),
@@ -884,7 +925,7 @@ class SSHMirror:
             )
             clear_n_console_rows(1)
             if result.exit_status != 0:
-                stderr = result.stderr.strip() or result.stdout.strip() or 'docker inspect failed'
+                stderr = self._command_error_text(result)
                 raise RuntimeError(
                     f'restart_container check failed for {self.restart_container["container_name"]}: {stderr}'
                 )
