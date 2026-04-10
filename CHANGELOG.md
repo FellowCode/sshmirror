@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.17
+
+### Fixed
+
+- Moved `push` and `pull` confirmation prompts ahead of the live sync table so interactive confirmation and version description input work correctly.
+
 ## 0.1.16
 
 ### Changed

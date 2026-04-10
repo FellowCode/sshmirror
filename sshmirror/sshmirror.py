@@ -2014,16 +2014,26 @@ class SSHMirror:
         subtitle = 'These changes will be applied to the local project.'
         border_style = 'green'
         plan_state = self._build_sync_plan_state(migration, conflicts)
+        preview_panel = self._render_sync_plan(
+            title,
+            subtitle,
+            migration,
+            conflicts=conflicts,
+            border_style=border_style,
+            plan_state=plan_state,
+        )
+
+        console.print(preview_panel)
+
+        if require_confirm:
+            if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
+                raise UserAbort('Pull cancelled by user')
 
         with Live(
-            self._render_sync_plan(title, subtitle, migration, conflicts=conflicts, border_style=border_style, plan_state=plan_state),
+            preview_panel,
             console=console,
             refresh_per_second=8,
         ) as live:
-            if require_confirm:
-                if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
-                    raise UserAbort('Pull cancelled by user')
-
             await self._run_commands(self.commands.before_pull, migration, conn)
 
             if conflicts is not None and not conflicts.empty():
@@ -2078,17 +2088,26 @@ class SSHMirror:
         subtitle = 'These changes will be applied to the remote project.'
         border_style = 'cyan'
         plan_state = self._build_sync_plan_state(migration)
+        preview_panel = self._render_sync_plan(
+            title,
+            subtitle,
+            migration,
+            border_style=border_style,
+            plan_state=plan_state,
+        )
+
+        console.print(preview_panel)
+
+        if not self._confirm('Apply push changes?', 'Push cancelled by user'):
+            raise UserAbort('Push cancelled by user')
+
+        local_version.message = self._prompt_version_message()
 
         with Live(
-            self._render_sync_plan(title, subtitle, migration, border_style=border_style, plan_state=plan_state),
+            preview_panel,
             console=console,
             refresh_per_second=8,
         ) as live:
-            if not self._confirm('Apply push changes?', 'Push cancelled by user'):
-                raise UserAbort('Push cancelled by user')
-
-            local_version.message = self._prompt_version_message()
-
             await self._remote_create_downgrade(conn, migration, local_version)
 
             try:

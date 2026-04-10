@@ -13,3 +13,4 @@ venv/
 sshmirror.config.yml
 sshmirror.ignore.txt
 .sshmirror/
+.env
