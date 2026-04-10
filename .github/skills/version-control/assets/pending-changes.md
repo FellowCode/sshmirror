@@ -17,3 +17,4 @@ Rules:
 - When a version is finalized, move applied items into CHANGELOG.md and delete them from this file.
 
 Pending items:
+- Changed: Updated the release-preparation workflow to optionally commit, tag, and push a confirmed release to git for PyPI publishing.

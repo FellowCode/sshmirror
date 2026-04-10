@@ -1,6 +1,6 @@
 ---
 name: version-control
-description: 'Use when the user asks to create a new version, bump a release, prepare a release, fix the latest version, update the changelog from recorded edits, or manage version notes. Reads pending changes from the tracking file, writes changelog entries, clears applied items after release notes are recorded, and prepares a short git commit summary for the release.'
+description: 'Use when the user asks to create a new version, bump a release, prepare a release, fix the latest version, update the changelog from recorded edits, or manage version notes. Reads pending changes from the tracking file, writes changelog entries, clears applied items after release notes are recorded, prepares a short git commit summary for the release, and can optionally publish the release to git with a version tag after confirmation.'
 argument-hint: 'Version task, for example: prepare release 0.1.20 from pending changes'
 user-invocable: true
 ---
@@ -59,8 +59,15 @@ Example:
 6. Preserve existing release entries and append or insert only the needed sections.
 7. Prepare a short git commit summary for the release based on the same applied changes.
    - Required format: `{version} {description}`
-8. After the changelog is successfully updated, remove the applied items from [pending-changes.md](./assets/pending-changes.md).
-9. Leave any unapplied or ambiguous items in the tracking file.
+8. When the user asks to `подготовь релиз`, ask whether the new version should also be uploaded to git.
+   - Ask this only after the release notes and version files are updated successfully.
+   - If the answer is positive, perform the git release flow yourself:
+     - create a normal git commit for the release files using the prepared commit summary
+     - create a version tag in the form `v{version}`
+     - push the branch commit and the new tag so the existing automation can publish the release to PyPI
+   - If the answer is negative, do not run any git commands.
+9. After the changelog is successfully updated, remove the applied items from [pending-changes.md](./assets/pending-changes.md).
+10. Leave any unapplied or ambiguous items in the tracking file.
 
 ## Procedure For Updating The Latest Version
 
@@ -78,6 +85,9 @@ Example:
 - When the user asks to `подготовь релиз`, include both:
    - the changelog-ready release notes
    - a short git commit summary in one concise sentence or phrase
+- For `подготовь релиз`, also ask whether the agent should upload the release to git.
+- If the user approves git upload, complete the release commit, create the `v{version}` tag, and push both the commit and tag.
+- If the user declines git upload, stop after preparing files and reporting the release notes plus commit summary.
 - The git commit summary must use this exact shape: `{version} {description}`.
 - Example: `0.1.21 restore push and pull confirmation prompts`.
 - Present the git commit summary as copyable code text, not as a shell command.
@@ -92,4 +102,5 @@ Example:
 - Do not clear the tracking file before `CHANGELOG.md` is updated successfully.
 - Keep release wording concise and user-facing.
 - Keep the git commit summary concise, aligned with the release notes, and in `{version} {description}` format.
+- Never push a release commit or tag without explicitly asking the user first during `подготовь релиз`.
 - If the pending file is empty, report that there is nothing to release instead of inventing entries.
