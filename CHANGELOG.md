@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.21
+
+### Fixed
+
+- Reversed View current changes create/delete labels so they reflect the actual sync direction instead of the old server-oriented wording.
+- Restored push and pull confirmation prompts so the preview table no longer blocks interactive input before sync starts.
+
 ## 0.1.20
 
 ### Changed

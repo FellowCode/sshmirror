@@ -533,7 +533,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 mirror.list_current_changes = AsyncMock(return_value=[
                     DiffFileChange(action='change', path='src/large.bin', inspectable=False),
                     DiffFileChange(action='change', path='src/app.py', inspectable=True),
-                    DiffFileChange(action='create on server', path='src/new.py', inspectable=False),
+                    DiffFileChange(action='delete', path='src/new.py', inspectable=False),
                 ])
                 mirror.get_current_change_detail = AsyncMock(return_value=DiffDetail(
                     path='src/app.py',
@@ -553,7 +553,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[1] == ['src/app.py', 'Back'])
                 self.assertIn('changed | src/large.bin (not selectable)', file_prompt_call.args[0])
                 self.assertIn('changed | src/app.py', file_prompt_call.args[0])
-                self.assertIn('create on server | src/new.py (not selectable)', file_prompt_call.args[0])
+                self.assertIn('deleted | src/new.py (not selectable)', file_prompt_call.args[0])
                 self.assertEqual(file_prompt_call.args[1], ['src/app.py', 'Back'])
                 clear_mock.assert_called_once()
 
@@ -1485,7 +1485,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 class FakeLive:
                     def __init__(self, *args, **kwargs):
-                        events.append(f"live_init:{kwargs.get('transient', False)}")
+                        events.append('live_init')
 
                     def __enter__(self):
                         events.append('live_enter')
@@ -1498,7 +1498,10 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                     def update(self, *args, **kwargs):
                         pass
 
-                with patch('sshmirror.sshmirror.Live', FakeLive), \
+                with patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows', side_effect=lambda *args, **kwargs: events.append('clear')), \
+                     patch.object(mirror, '_get_renderable_line_count', return_value=5), \
+                     patch('sshmirror.sshmirror.Live', FakeLive), \
                      patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
                      patch.object(mirror, '_prompt_version_message', side_effect=lambda: events.append('message') or 'feature sync'), \
                      patch.object(mirror, '_remote_create_downgrade', new=AsyncMock()), \
@@ -1513,8 +1516,8 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                     asyncio.run(mirror._push(version, migration, dummy_conn))
 
                 self.assertEqual(
-                    events[:7],
-                    ['live_init:True', 'live_enter', 'confirm', 'live_exit', 'message', 'live_init:False', 'live_enter'],
+                    events[:6],
+                    ['print', 'confirm', 'clear', 'message', 'live_init', 'live_enter'],
                 )
 
     def test_pull_renders_preview_before_confirmation_and_live_updates(self):
@@ -1541,7 +1544,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 class FakeLive:
                     def __init__(self, *args, **kwargs):
-                        events.append(f"live_init:{kwargs.get('transient', False)}")
+                        events.append('live_init')
 
                     def __enter__(self):
                         events.append('live_enter')
@@ -1553,7 +1556,10 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                     def update(self, *args, **kwargs):
                         pass
 
-                with patch('sshmirror.sshmirror.Live', FakeLive), \
+                with patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows', side_effect=lambda *args, **kwargs: events.append('clear')), \
+                     patch.object(mirror, '_get_renderable_line_count', return_value=5), \
+                     patch('sshmirror.sshmirror.Live', FakeLive), \
                      patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
                      patch.object(mirror, '_run_commands', new=AsyncMock()), \
                      patch.object(mirror, '_download_files', new=AsyncMock()), \
@@ -1563,7 +1569,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 self.assertEqual(
                     events[:5],
-                    ['live_init:True', 'live_enter', 'confirm', 'live_init:False', 'live_enter'],
+                    ['print', 'confirm', 'clear', 'live_init', 'live_enter'],
                 )
 
     def test_downgrade_renders_preview_before_confirmation_and_live_updates(self):
@@ -1599,7 +1605,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 class FakeLive:
                     def __init__(self, *args, **kwargs):
-                        events.append(f"live_init:{kwargs.get('transient', False)}")
+                        events.append('live_init')
 
                     def __enter__(self):
                         events.append('live_enter')
@@ -1611,9 +1617,11 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                     def update(self, *args, **kwargs):
                         pass
 
-                with patch('sshmirror.sshmirror.Live', FakeLive), \
+                with patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows', side_effect=lambda *args, **kwargs: events.append('clear')), \
+                     patch.object(mirror, '_get_renderable_line_count', return_value=5), \
+                     patch('sshmirror.sshmirror.Live', FakeLive), \
                      patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
-                     patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
                      patch.object(mirror, '_run_remote_script_from_project_root', new=AsyncMock()), \
                      patch.object(mirror, 'force_pull', new=AsyncMock()) as force_pull_mock, \
                      patch.object(mirror, '_maybe_restart_container', new=AsyncMock()) as restart_mock:
@@ -1621,7 +1629,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 self.assertEqual(
                     events[:5],
-                    ['live_init:True', 'live_enter', 'confirm', 'live_init:False', 'live_enter'],
+                    ['print', 'confirm', 'clear', 'live_init', 'live_enter'],
                 )
                 force_pull_mock.assert_awaited_once_with(require_confirm=False)
                 restart_mock.assert_awaited_once()

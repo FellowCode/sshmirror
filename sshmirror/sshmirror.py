@@ -825,6 +825,10 @@ class SSHMirror:
 
         return Panel(Group(Text(subtitle, style='dim'), table), title=title, border_style=border_style)
 
+    @staticmethod
+    def _get_renderable_line_count(renderable: typing.Any) -> int:
+        return max(1, len(console.render_lines(renderable, console.options, pad=False)))
+
     async def _scan_project_maps_with_progress(
         self,
         conn: SSHClientConnection,
@@ -901,8 +905,8 @@ class SSHMirror:
             migration,
             local_state,
             remote_map,
-            created_action='create on server',
-            deleted_action='delete on server',
+            created_action='delete',
+            deleted_action='create',
         )
 
     async def get_current_change_detail(self, path: str) -> DiffDetail:
@@ -929,7 +933,7 @@ class SSHMirror:
 
             migration = local_state.migrate_to(remote_map)
             file_action = self._find_file_action(
-                self._build_file_actions(migration, created_action='create on server', deleted_action='delete on server'),
+                self._build_file_actions(migration, created_action='delete', deleted_action='create'),
                 path,
             )
             local_entry = local_state.get_file(path)
@@ -2196,14 +2200,10 @@ class SSHMirror:
         )
 
         if require_confirm:
-            with Live(
-                preview_panel,
-                console=console,
-                transient=True,
-                auto_refresh=False,
-            ):
-                if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
-                    raise UserAbort('Pull cancelled by user')
+            console.print(preview_panel)
+            if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
+                raise UserAbort('Pull cancelled by user')
+            clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
 
         with Live(
             preview_panel,
@@ -2279,17 +2279,13 @@ class SSHMirror:
             plan_state=plan_state,
         )
 
-        with Live(
-            preview_panel,
-            console=console,
-            transient=True,
-            auto_refresh=False,
+        console.print(preview_panel)
+        if not self._confirm(
+            f'Apply downgrade to version {target_version.dt.isoformat()} UTC?',
+            'Downgrade cancelled by user',
         ):
-            if not self._confirm(
-                f'Apply downgrade to version {target_version.dt.isoformat()} UTC?',
-                'Downgrade cancelled by user',
-            ):
-                raise UserAbort('Downgrade cancelled by user')
+            raise UserAbort('Downgrade cancelled by user')
+        clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
 
         all_paths = migration_changes.directories.all() + migration_changes.files.all()
         with Live(preview_panel, console=console, refresh_per_second=8) as live:
@@ -2354,15 +2350,10 @@ class SSHMirror:
             plan_state=plan_state,
         )
 
-        with Live(
-            preview_panel,
-            console=console,
-            transient=True,
-            auto_refresh=False,
-        ):
-            if not self._confirm('Apply push changes?', 'Push cancelled by user'):
-                raise UserAbort('Push cancelled by user')
-
+        console.print(preview_panel)
+        if not self._confirm('Apply push changes?', 'Push cancelled by user'):
+            raise UserAbort('Push cancelled by user')
+        clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
         local_version.message = self._prompt_version_message()
 
         with Live(
