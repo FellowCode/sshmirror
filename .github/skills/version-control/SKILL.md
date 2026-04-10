@@ -55,11 +55,12 @@ Example:
    - `Removed:` -> `### Removed`
    - `Docs:` -> include under `### Changed` unless the user explicitly wants documentation isolated.
 4. Update the requested version entry in `CHANGELOG.md`.
-5. Preserve existing release entries and append or insert only the needed sections.
-6. Prepare a short git commit summary for the release based on the same applied changes.
+5. Update all version metadata files consistently, including `pyproject.toml`, `sshmirror/__init__.py`, and `sshmirror/_version.py` when present.
+6. Preserve existing release entries and append or insert only the needed sections.
+7. Prepare a short git commit summary for the release based on the same applied changes.
    - Required format: `{version} {description}`
-7. After the changelog is successfully updated, remove the applied items from [pending-changes.md](./assets/pending-changes.md).
-8. Leave any unapplied or ambiguous items in the tracking file.
+8. After the changelog is successfully updated, remove the applied items from [pending-changes.md](./assets/pending-changes.md).
+9. Leave any unapplied or ambiguous items in the tracking file.
 
 ## Procedure For Updating The Latest Version
 
@@ -67,9 +68,10 @@ Example:
 2. Filter the pending items down to sshmirror library and CLI changes only.
 3. Read the latest version section in `CHANGELOG.md`.
 4. Merge pending items into that latest version section without rewriting older releases.
-5. Prepare a short git commit summary that matches the updated release notes.
+5. Update all version metadata files consistently, including `pyproject.toml`, `sshmirror/__init__.py`, and `sshmirror/_version.py` when present.
+6. Prepare a short git commit summary that matches the updated release notes.
    - Required format: `{version} {description}`
-6. Clear only the items that were added to the changelog.
+7. Clear only the items that were added to the changelog.
 
 ## Output Requirements For Release Preparation
 

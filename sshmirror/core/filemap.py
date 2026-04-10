@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from .._version import DIR_VERSION_FORMAT
 from .schemas import Difference, MigrationChanges
+from .exceptions import IncompatibleVersionFormat
 import aiofiles
 import hashlib
 import json
@@ -48,6 +50,8 @@ class DirVersion:
     uid: str = field(default_factory=lambda: uuid.uuid4().hex)
     author: typing.Optional[str] = None
     message: str = 'update'
+    created_by_sshmirror_version: str | None = None
+    version_format: int = DIR_VERSION_FORMAT
     
     def asdict(self):
         return {
@@ -55,6 +59,8 @@ class DirVersion:
             'uid': self.uid,
             'author': self.author,
             'message': self.message,
+            'created_by_sshmirror_version': self.created_by_sshmirror_version,
+            'version_format': self.version_format,
             'filemap': self.filemap.asdict()
         }
     
@@ -63,11 +69,31 @@ class DirVersion:
     
     @classmethod
     def from_dict(cls, d: dict):
-        d['dt'] = datetime.datetime.fromisoformat(d['dt']).replace(tzinfo=datetime.timezone.utc)
-        d['filemap'] = FileMap.from_dict(d['filemap'])
-        if 'message' not in d or not d['message']:
-            d['message'] = 'update'
-        return cls(**d)
+        data = dict(d)
+        version_format = int(data.get('version_format', DIR_VERSION_FORMAT))
+        if version_format > DIR_VERSION_FORMAT:
+            created_by = data.get('created_by_sshmirror_version') or 'a newer sshmirror version'
+            raise IncompatibleVersionFormat(
+                f'Version metadata format {version_format} was created by {created_by}. Update sshmirror to open this project safely.'
+            )
+
+        data['dt'] = datetime.datetime.fromisoformat(data['dt']).replace(tzinfo=datetime.timezone.utc)
+        data['filemap'] = FileMap.from_dict(data['filemap'])
+        if 'message' not in data or not data['message']:
+            data['message'] = 'update'
+        data.setdefault('created_by_sshmirror_version', None)
+        data['version_format'] = version_format
+
+        allowed_keys = {
+            'dt',
+            'filemap',
+            'uid',
+            'author',
+            'message',
+            'created_by_sshmirror_version',
+            'version_format',
+        }
+        return cls(**{key: value for key, value in data.items() if key in allowed_keys})
     
     @classmethod
     def loads(cls, s: str):

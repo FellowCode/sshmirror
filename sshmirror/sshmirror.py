@@ -30,19 +30,21 @@ from rich import box
 import beartype as bt
 
 try:
+    from ._version import __version__, DIR_VERSION_FORMAT
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
     from .core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
     from .core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from .core.filewatcher import Filewatcher
     from .core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
-    from .core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
+    from .core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, UserAbort, VersionAlreadyExists
 except ImportError:
+    from _version import __version__, DIR_VERSION_FORMAT
     from config import SSHMirrorCallbacks, SSHMirrorConfig
     from core.schemas import CmdConfig, Command, CopyPath, DiffDetail, DiffFileChange, DiffVersionInfo, MigrationChanges
     from core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from core.filewatcher import Filewatcher
     from core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
-    from core.exceptions import ErrorLocalVersion, UserAbort, VersionAlreadyExists
+    from core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, UserAbort, VersionAlreadyExists
 
 console = Console()
 
@@ -2201,7 +2203,7 @@ class SSHMirror:
 
         if require_confirm:
             console.print(preview_panel)
-            if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
+            if not self._confirm('Apply pull changes? (Remote -> Local)', 'Pull cancelled by user'):
                 raise UserAbort('Pull cancelled by user')
             clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
 
@@ -2351,7 +2353,7 @@ class SSHMirror:
         )
 
         console.print(preview_panel)
-        if not self._confirm('Apply push changes?', 'Push cancelled by user'):
+        if not self._confirm('Apply push changes? (Local -> Remote)', 'Push cancelled by user'):
             raise UserAbort('Push cancelled by user')
         clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
         local_version.message = self._prompt_version_message()
@@ -2504,6 +2506,8 @@ class SSHMirror:
         for i, result in enumerate(results):
             try:
                 versions.append(DirVersion.loads(result.stdout))
+            except IncompatibleVersionFormat:
+                raise
             except:
                 print(f'WARNING. On remote version file invalid format, {version_filenames[i]}')
         return versions
@@ -2549,7 +2553,14 @@ class SSHMirror:
         return DirVersion.loads(s)
     
     def _create_version(self, filemap: FileMap):
-        return DirVersion(dt=datetime.datetime.now(datetime.timezone.utc), author=self.author, message='update', filemap=filemap)
+        return DirVersion(
+            dt=datetime.datetime.now(datetime.timezone.utc),
+            author=self.author,
+            message='update',
+            filemap=filemap,
+            created_by_sshmirror_version=__version__,
+            version_format=DIR_VERSION_FORMAT,
+        )
     
     async def _save_version(self, v: DirVersion, ignore_error=False) -> str:
         path = os.path.join(self.versions_directory, v.filename())

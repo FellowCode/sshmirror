@@ -236,7 +236,7 @@ def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
         elif action == 'View current changes':
             args.current_diff = True
         elif action == 'Versions':
-            version_action = prompt_choice('Versions:', ['History', 'Compare', 'Back'], default='History')
+            version_action = prompt_choice('Versions:', ['History', 'Compare', 'Back'])
             if version_action == 'Back':
                 continue
             if version_action == 'History':
@@ -675,23 +675,24 @@ async def _show_version_history_cli(mirror: SSHMirror) -> None:
         console.print('Need at least two remote versions to inspect history', style='yellow')
         return
 
-    target_version = await _choose_version_interactively(mirror, 'Choose version to inspect')
-    if target_version is None:
-        return
+    while True:
+        target_version = await _choose_version_interactively(mirror, 'Choose version to inspect')
+        if target_version is None:
+            return
 
-    if target_version.index is None:
-        raise ValueError('Selected version is missing index information')
+        if target_version.index is None:
+            raise ValueError('Selected version is missing index information')
 
-    if target_version.index <= 0:
-        console.print('No previous version available for comparison', style='yellow')
-        return
+        if target_version.index <= 0:
+            console.print('No previous version available for comparison', style='yellow')
+            continue
 
-    base_version = await mirror.get_remote_version_info_by_index(target_version.index - 1)
-    if base_version is None:
-        console.print('Previous version is unavailable for comparison', style='yellow')
-        return
+        base_version = await mirror.get_remote_version_info_by_index(target_version.index - 1)
+        if base_version is None:
+            console.print('Previous version is unavailable for comparison', style='yellow')
+            continue
 
-    await _inspect_version_range_cli(mirror, base_version, target_version)
+        await _inspect_version_range_cli(mirror, base_version, target_version)
 
 
 def main(argv: list[str] | None = None) -> int:

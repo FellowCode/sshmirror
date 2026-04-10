@@ -18,6 +18,13 @@ except Exception:
 
 console = Console()
 _PROMPT_FALLBACK = object()
+_RU_TO_EN_KEYBOARD = str.maketrans({
+    'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
+    'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
+    'д': 'l', 'ж': ';', 'э': "'", 'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm',
+    'б': ',', 'ю': '.',
+})
+_EN_TO_RU_KEYBOARD = str.maketrans({value: key for key, value in _RU_TO_EN_KEYBOARD.items()})
 
 
 def _questionary_available() -> bool:
@@ -74,6 +81,26 @@ def _read_hidden_input(prompt: str) -> str:
         raise UserAbort('Cancelled by user') from exc
 
 
+def _normalize_confirm_value(value: str) -> bool | None:
+    normalized = value.strip().lower()
+    if normalized == '':
+        return None
+
+    variants = {
+        normalized,
+        normalized.translate(_RU_TO_EN_KEYBOARD),
+        normalized.translate(_EN_TO_RU_KEYBOARD),
+    }
+    yes_values = {'yes', 'y', 'да', 'д', 'lf', 'l', 'нуу', 'н'}
+    no_values = {'no', 'n', 'нет', 'не', 'тщ', 'т'}
+
+    if any(item in yes_values for item in variants):
+        return True
+    if any(item in no_values for item in variants):
+        return False
+    return None
+
+
 def _fallback_choice_prompt(prompt: str, choices: list[str], default: str | None = None) -> str:
     print(prompt)
     for index, choice in enumerate(choices, start=1):
@@ -96,11 +123,9 @@ def _fallback_choice_prompt(prompt: str, choices: list[str], default: str | None
 
 def _fallback_confirm_prompt(prompt: str) -> bool:
     while True:
-        value = _read_plain_input(f'{prompt} (yes/no): ').strip().lower()
-        if value in ['yes', 'y']:
-            return True
-        if value in ['no', 'n']:
-            return False
+        value = _normalize_confirm_value(_read_plain_input(f'{prompt} (yes/no): '))
+        if value is not None:
+            return value
         console.print('Please answer yes or no', style='yellow')
 
 
@@ -122,14 +147,18 @@ def prompt_choice(prompt: str, choices: list[str], default: str | None = None, s
 
 
 def prompt_confirm(prompt: str) -> bool:
-    result = _questionary_ask(
-        lambda: questionary.confirm(prompt, default=False),
-        'Interactive questionary confirm is unavailable, fallback to plain input',
-    )
-    if result is not _PROMPT_FALLBACK:
-        return bool(result)
+    while True:
+        result = _questionary_ask(
+            lambda: questionary.text(f'{prompt} (yes/no)'),
+            'Interactive questionary confirm is unavailable, fallback to plain input',
+        )
+        if result is _PROMPT_FALLBACK:
+            return _fallback_confirm_prompt(prompt)
 
-    return _fallback_confirm_prompt(prompt)
+        normalized = _normalize_confirm_value(result)
+        if normalized is not None:
+            return normalized
+        console.print('Please answer yes or no', style='yellow')
 
 
 def prompt_text(prompt: str, default: str | None = 'update') -> str:

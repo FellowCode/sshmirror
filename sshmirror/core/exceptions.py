@@ -8,3 +8,7 @@ class UserAbort(Exception):
 
 class VersionAlreadyExists(Exception):
     pass
+
+
+class IncompatibleVersionFormat(Exception):
+    pass

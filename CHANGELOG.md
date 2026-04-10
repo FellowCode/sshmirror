@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.22
+
+### Added
+
+- Saved the sshmirror version in generated directory version metadata and added a compatibility guard for future incompatible version formats.
+
+### Changed
+
+- Clarified push and pull confirmation prompts with explicit sync directions for local and remote changes.
+- Removed the default highlight from `History` in the `Versions` submenu for a cleaner interactive menu.
+- Returned Back from History version inspection to the version list instead of exiting history browsing.
+
+### Fixed
+
+- Made yes/no confirmation prompts accept answers across Russian and English keyboard layouts, including mistyped layout input.
+
 ## 0.1.21
 
 ### Fixed

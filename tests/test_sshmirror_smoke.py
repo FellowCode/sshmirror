@@ -5,6 +5,7 @@ import sys
 import tempfile
 import asyncio
 import datetime
+import json
 import unittest
 from asyncssh import SSHClientConnection
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
+from sshmirror._version import DIR_VERSION_FORMAT
 from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
@@ -20,6 +22,7 @@ from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo, 
 from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from sshmirror.prompts import _questionary_available, prompt_choice, prompt_confirm
 from sshmirror.sshmirror import RemoteRollbackError, RemoteSyncError
+from sshmirror.core.exceptions import IncompatibleVersionFormat
 
 
 @contextmanager
@@ -58,6 +61,51 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(mirror.remotedir, '/app/')
                 self.assertEqual(mirror._create_version(FileMap()).message, 'update')
                 self.assertTrue((tmp_path / '.sshmirror' / 'versions').exists())
+
+    def test_created_version_records_sshmirror_version_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                version = mirror._create_version(FileMap())
+
+                self.assertEqual(version.created_by_sshmirror_version, __version__)
+                self.assertEqual(version.version_format, DIR_VERSION_FORMAT)
+
+    def test_dirversion_rejects_newer_incompatible_metadata_format(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+                version_payload = {
+                    'dt': '2026-04-10T10:00:00+00:00',
+                    'uid': 'future-version',
+                    'author': 'tester',
+                    'message': 'future metadata',
+                    'created_by_sshmirror_version': '9.9.9',
+                    'version_format': DIR_VERSION_FORMAT + 1,
+                    'filemap': FileMap().asdict(),
+                }
+
+                with self.assertRaisesRegex(IncompatibleVersionFormat, 'Update sshmirror'):
+                    DirVersion.loads(json.dumps(version_payload))
 
     def test_invalid_config_requires_main_connection_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -442,7 +490,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         ))
         mirror.render_diff_detail = Mock()
 
-        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(versions_page[1]), 'src/app.py', 'Back', 'Back']), \
+        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(versions_page[1]), 'src/app.py', 'Back', 'Back', 'Back']), \
              patch('sshmirror.cli.clear_n_console_rows') as clear_rows_mock:
             asyncio.run(_show_version_history_cli(mirror))
 
@@ -450,6 +498,36 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         mirror.get_remote_version_info_by_index.assert_awaited_once_with(1)
         mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-1.json', 'version-2.json')
         mirror.get_version_change_detail_by_range.assert_awaited_once_with('version-1.json', 'version-2.json', 1, 2, 'src/app.py')
+
+    def test_show_version_history_cli_returns_to_version_list_after_back(self):
+        target_version = DiffVersionInfo(
+            uid='2',
+            label='2026-04-09 12:02:00 UTC | 00000002 | user | msg-2',
+            dt='dt-2',
+            index=2,
+            filename='version-2.json',
+        )
+        previous_version = DiffVersionInfo(
+            uid='1',
+            label='2026-04-09 12:01:00 UTC | 00000001 | user | msg-1',
+            dt='dt-1',
+            index=1,
+            filename='version-1.json',
+        )
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(return_value=([target_version], 3))
+        mirror.get_remote_version_info_by_index = AsyncMock(return_value=previous_version)
+
+        choose_mock = AsyncMock(side_effect=[target_version, None])
+        inspect_mock = AsyncMock()
+
+        with patch('sshmirror.cli._choose_version_interactively', choose_mock), \
+             patch('sshmirror.cli._inspect_version_range_cli', inspect_mock), \
+             patch('sshmirror.cli.clear_n_console_rows'):
+            asyncio.run(_show_version_history_cli(mirror))
+
+        self.assertEqual(choose_mock.await_count, 2)
+        inspect_mock.assert_awaited_once_with(mirror, previous_version, target_version)
 
     def test_file_inspection_choice_shows_created_and_deleted_as_non_selectable(self):
         base_versions_page = [
@@ -1079,6 +1157,27 @@ class SSHMirrorSmokeTests(unittest.TestCase):
              patch('builtins.input', side_effect=KeyboardInterrupt):
             with self.assertRaises(UserAbort):
                 prompt_confirm('Proceed?')
+
+    def test_fallback_confirm_accepts_russian_yes(self):
+        with patch('sshmirror.prompts.questionary', None), \
+             patch('builtins.input', return_value='да'):
+            self.assertTrue(prompt_confirm('Proceed?'))
+
+    def test_fallback_confirm_accepts_wrong_layout_no(self):
+        with patch('sshmirror.prompts.questionary', None), \
+             patch('builtins.input', return_value='ytn'):
+            self.assertFalse(prompt_confirm('Proceed?'))
+
+    def test_questionary_confirm_accepts_wrong_layout_yes(self):
+        question = Mock()
+        question.ask.return_value = 'lf'
+        questionary_mock = Mock()
+        questionary_mock.text.return_value = question
+
+        with patch('sshmirror.prompts.questionary', questionary_mock), \
+             patch('sys.stdin.isatty', return_value=True), \
+             patch('sys.stdout.isatty', return_value=True):
+            self.assertTrue(prompt_confirm('Proceed?'))
 
     def test_interactive_menu_uses_plain_labels(self):
         menu_items = _build_interactive_menu_items(
