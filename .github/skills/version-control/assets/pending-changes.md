@@ -18,3 +18,6 @@ Rules:
 
 Pending items:
 - Changed: Updated the release-preparation workflow to optionally commit, tag, and push a confirmed release to git for PyPI publishing.
+- Changed: Displayed the current sshmirror version unobtrusively when starting the interactive CLI.
+- Fixed: Stopped Ctrl+C in the interactive menu from surfacing a UserAbort error message.
+- Changed: Reworked the Status view into a staged overview with structured local, remote, and live-diff panels.

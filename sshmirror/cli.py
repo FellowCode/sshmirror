@@ -7,6 +7,7 @@ import sys
 from collections import OrderedDict
 
 try:
+    from ._version import __version__
     from .config import SSHMirrorCallbacks, SSHMirrorConfig
     from .core.schemas import DiffFileChange, DiffVersionInfo
     from rich import box
@@ -16,6 +17,7 @@ try:
     from .core.exceptions import UserAbort
     from .core.utils import clear_n_console_rows, read_text_file
 except ImportError:
+    from _version import __version__
     from config import SSHMirrorCallbacks, SSHMirrorConfig
     from core.schemas import DiffFileChange, DiffVersionInfo
     from rich import box
@@ -189,9 +191,19 @@ def _build_interactive_menu_items(
     return menu_items
 
 
+def _print_interactive_version() -> None:
+    console.print(f'SSHMirror v{__version__}', style='dim')
+
+
+def _is_silent_user_abort(exc: UserAbort) -> bool:
+    message = str(exc).strip().lower()
+    return message in {'', 'cancelled by user'}
+
+
 def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
     args.exit_requested = False
     args.version_history = False
+    _print_interactive_version()
     while True:
         has_config = _find_default_cli_path('sshmirror.config.yml') is not None
         has_ignore = _find_default_cli_path('sshmirror.ignore.txt') is not None
@@ -788,19 +800,14 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    is_interactive_launch = argv is None and len(sys.argv) == 1
-    if is_interactive_launch:
-        args = _configure_interactive_args(args)
-        if getattr(args, 'exit_requested', False):
-            return 0
-
     try:
+        is_interactive_launch = argv is None and len(sys.argv) == 1
+        if is_interactive_launch:
+            args = _configure_interactive_args(args)
+            if getattr(args, 'exit_requested', False):
+                return 0
+
         mirror = _create_mirror_from_args(args)
-    except FileNotFoundError as exc:
-        console.print(str(exc), style='red')
-        return 1
-
-    try:
         if _has_stashed_changes() and not is_interactive_launch:
             console.print('Reminder: stashed changes are available. Use restore stash to bring them back.', style='yellow')
         if args.test_connection:
@@ -822,8 +829,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             asyncio.run(mirror.run())
         return 0
+    except FileNotFoundError as exc:
+        console.print(str(exc), style='red')
+        return 1
     except UserAbort as exc:
-        if str(exc):
+        if not _is_silent_user_abort(exc):
             console.print(str(exc), style='yellow')
         return 0
     except Exception as exc:

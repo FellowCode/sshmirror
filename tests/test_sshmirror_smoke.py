@@ -11,11 +11,12 @@ import unittest
 from asyncssh import SSHClientConnection
 from contextlib import contextmanager
 from pathlib import Path
+from rich.panel import Panel
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
 from sshmirror._version import DIR_VERSION_FORMAT
-from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_display_label, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser, main
+from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_display_label, _format_version_choice_label, _format_version_page_prompt, _is_silent_user_abort, _print_interactive_version, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser, main
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
@@ -1453,6 +1454,12 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
         self.assertTrue(configured_args.exit_requested)
 
+    def test_interactive_mode_prints_version_subtly(self):
+        with patch('sshmirror.cli.console.print') as print_mock:
+            _print_interactive_version()
+
+        print_mock.assert_called_once_with(f'SSHMirror v{__version__}', style='dim')
+
     def test_main_ctrl_c_exits_cleanly_without_error(self):
         captured_handler = {}
         configured_args = argparse.Namespace(exit_requested=True)
@@ -1472,6 +1479,20 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         self.assertEqual(exit_info.exception.code, 0)
         print_mock.assert_not_called()
 
+    def test_main_interactive_userabort_cancellation_exits_cleanly_without_error(self):
+        with patch('sshmirror.cli._configure_interactive_args', side_effect=UserAbort('Cancelled by user')), \
+             patch('sshmirror.cli.console.print') as print_mock, \
+             patch('sshmirror.cli.sys.argv', ['sshmirror']):
+            result = main()
+
+        self.assertEqual(result, 0)
+        print_mock.assert_not_called()
+
+    def test_silent_user_abort_detects_cancel_message(self):
+        self.assertTrue(_is_silent_user_abort(UserAbort('Cancelled by user')))
+        self.assertTrue(_is_silent_user_abort(UserAbort('')))
+        self.assertFalse(_is_silent_user_abort(UserAbort('Push cancelled by user')))
+
     def test_interactive_create_config_exits_after_creation(self):
         args = build_parser().parse_args([])
 
@@ -1486,6 +1507,60 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
             self.assertTrue(configured_args.exit_requested)
             self.assertTrue((tmp_path / 'sshmirror.config.yml').exists())
+
+    def test_status_renders_overview_and_section_panels(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                prevstate = FileMap()
+                prevstate.add('tracked.txt', 'md5-old', size=3, mtime=1)
+                local_state = FileMap()
+                local_state.add('tracked.txt', 'md5-local', size=4, mtime=2)
+                remote_map = FileMap()
+                remote_map.add('tracked.txt', 'md5-remote', size=5, mtime=3)
+
+                local_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='localversion123456',
+                    author='tester',
+                    message='baseline',
+                    filemap=prevstate,
+                )
+                remote_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 11, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='remoteversion12345',
+                    author='tester',
+                    message='remote update',
+                    filemap=remote_map,
+                )
+
+                class DummyConn:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                with patch.object(mirror, '_load_prevstate', AsyncMock(return_value=prevstate)), \
+                     patch.object(mirror, '_get_local_version', AsyncMock(return_value=local_version)), \
+                     patch.object(mirror, '_get_remote_versions_stack', AsyncMock(return_value=[local_version, remote_version])), \
+                     patch.object(mirror, '_scan_project_maps_with_progress', AsyncMock(return_value=(local_state, remote_map))), \
+                     patch('sshmirror.sshmirror.asyncssh.connect', return_value=DummyConn()), \
+                     patch('sshmirror.sshmirror.console.print') as print_mock:
+                    asyncio.run(mirror.status())
+
+                panels = [call.args[0] for call in print_mock.call_args_list if call.args and isinstance(call.args[0], Panel)]
+                self.assertEqual([panel.title for panel in panels], ['Status', 'Local changes', 'Remote changes', 'Live local vs remote'])
 
     def test_fallback_created_config_contains_field_descriptions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

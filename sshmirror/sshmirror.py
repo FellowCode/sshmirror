@@ -828,6 +828,93 @@ class SSHMirror:
         return Panel(Group(Text(subtitle, style='dim'), table), title=title, border_style=border_style)
 
     @staticmethod
+    def _format_migration_summary(migration: MigrationChanges | Migration) -> str:
+        return (
+            f'+{len(migration.files.created)} ~{len(migration.files.changed)} -{len(migration.files.deleted)} files, '
+            f'+{len(migration.dirs.created)} -{len(migration.dirs.deleted)} dirs'
+        )
+
+    @staticmethod
+    def _render_status_note(title: str, message: str, *, border_style: str = 'yellow') -> Panel:
+        return Panel(Text(message, style='dim'), title=title, border_style=border_style, expand=True)
+
+    def _render_status_overview(
+        self,
+        *,
+        initialized: bool,
+        has_stash: bool,
+        has_conflicts: bool,
+        prevstate_exists: bool,
+        local_version: DirVersion | None,
+        remote_versions: list[DirVersion],
+        live_diff: Migration,
+        local_version_missing_remote: bool = False,
+    ) -> Panel:
+        table = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=True, pad_edge=False)
+        table.add_column('Item', style='dim', width=22, no_wrap=True)
+        table.add_column('Value', ratio=1, overflow='fold')
+
+        table.add_row(
+            'Project state',
+            Text('initialized' if initialized else 'not initialized', style='green bold' if initialized else 'yellow'),
+        )
+        table.add_row(
+            'Stashed changes',
+            Text('available' if has_stash else 'none', style='yellow bold' if has_stash else 'dim'),
+        )
+        table.add_row(
+            'Conflicts',
+            Text('present' if has_conflicts else 'none', style='red bold' if has_conflicts else 'dim'),
+        )
+        table.add_row(
+            'Local sync state',
+            Text('tracked' if prevstate_exists else 'not created yet', style='green bold' if prevstate_exists else 'yellow'),
+        )
+
+        if local_version is None:
+            local_version_text = Text('not created yet', style='yellow')
+        else:
+            local_version_text = Text(
+                f'{local_version.uid[:8]} | {local_version.author or "-"} | {local_version.message or "update"}',
+                style='cyan',
+            )
+        table.add_row('Current local version', local_version_text)
+
+        if local_version is None:
+            remote_history_text = Text(
+                f'{len(remote_versions)} remote version(s) available before first sync',
+                style='yellow' if len(remote_versions) > 0 else 'dim',
+            )
+        elif local_version_missing_remote:
+            remote_history_text = Text(
+                'local version missing on remote, showing available remote history',
+                style='yellow',
+            )
+        else:
+            remote_delta_count = max(0, len(remote_versions) - 1)
+            remote_history_text = Text(
+                'up to date with latest remote version' if remote_delta_count == 0 else f'{remote_delta_count} newer remote version(s)',
+                style='green bold' if remote_delta_count == 0 else 'yellow',
+            )
+        table.add_row('Remote history', remote_history_text)
+
+        live_state_text = Text(
+            'projects are equal' if live_diff.empty() else f'drift detected: {self._format_migration_summary(live_diff)}',
+            style='green bold' if live_diff.empty() else 'yellow',
+        )
+        table.add_row('Live local vs remote', live_state_text)
+
+        return Panel(
+            Group(
+                Text('Local sync snapshot and remote drift overview.', style='dim'),
+                table,
+            ),
+            title='Status',
+            border_style='green',
+            expand=True,
+        )
+
+    @staticmethod
     def _get_renderable_line_count(renderable: typing.Any) -> int:
         return max(1, len(console.render_lines(renderable, console.options, pad=False)))
 
@@ -1875,54 +1962,87 @@ class SSHMirror:
 
     async def status(self):
         self._refresh_ignore_file_path()
-        console.print('Status', style='green bold')
-        console.print(f'  initialized: {_is_sshmirror_initialized()}', style='cyan')
-        console.print(f'  stash: {_has_stashed_changes()}', style='cyan')
-        console.print(f'  conflicts: {os.path.exists(self.conflicts_file)}', style='cyan')
-
+        initialized = _is_sshmirror_initialized()
+        has_stash = _has_stashed_changes()
+        has_conflicts = os.path.exists(self.conflicts_file)
         prevstate = await self._load_prevstate()
-        local_state = await self.filewatcher.get_filemap(reference_map=prevstate)
-        if prevstate is None:
-            console.print('  local sync state: not created yet', style='yellow')
-        else:
-            local_migration = prevstate.migrate_to(local_state)
-            console.print('Local changes:', style='yellow')
-            if local_migration.empty():
-                console.print('  no local changes', style='green')
-            else:
-                local_migration.print_actions(prefix='  local > ')
+        local_version = await self._get_local_version()
+        local_version_missing_remote = False
 
-        console.print('Connect to remote...', style='yellow')
         async with asyncssh.connect(**self._build_connect_kwargs(
             host=self.host,
             port=self.port,
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
-            local_version = await self._get_local_version()
             try:
                 remote_versions = await self._get_remote_versions_stack(conn, start_version=local_version)
             except ErrorLocalVersion:
+                local_version_missing_remote = local_version is not None
                 remote_versions = await self._get_remote_versions_stack(conn)
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
-            remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
-
-        if local_version is None:
-            console.print('  local version state: not initialized', style='yellow')
-        elif len(remote_versions) <= 1:
-            console.print('Remote changes:', style='yellow')
-            console.print('  no remote changes since local version', style='green')
-        else:
-            remote_migration = remote_versions[0].filemap.migrate_to(remote_versions[-1].filemap)
-            console.print('Remote changes:', style='yellow')
-            remote_migration.print_actions(prefix='  remote > ')
+            local_state, remote_map = await self._scan_project_maps_with_progress(
+                conn,
+                local_reference_map=prevstate,
+                remote_reference_map=remote_reference,
+                title='Status',
+                subtitle='Scanning local and remote project state for the status overview.',
+                border_style='green',
+            )
 
         live_diff = local_state.migrate_to(remote_map)
-        console.print('Live local vs remote:', style='yellow')
-        if live_diff.empty():
-            console.print('  projects are equal', style='green')
+        console.print(self._render_status_overview(
+            initialized=initialized,
+            has_stash=has_stash,
+            has_conflicts=has_conflicts,
+            prevstate_exists=prevstate is not None,
+            local_version=local_version,
+            remote_versions=remote_versions,
+            live_diff=live_diff,
+            local_version_missing_remote=local_version_missing_remote,
+        ))
+
+        if prevstate is None:
+            console.print(self._render_status_note(
+                'Local changes',
+                'Local sync state has not been created yet. Run an initialization or sync before comparing local changes against a tracked baseline.',
+            ))
         else:
-            live_diff.print_actions(prefix='  diff > ')
+            local_migration = prevstate.migrate_to(local_state)
+            console.print(self._render_sync_plan(
+                'Local changes',
+                'Changes detected between the tracked local sync state and the current local project.',
+                local_migration,
+                border_style='yellow',
+            ))
+
+        if local_version is None:
+            console.print(self._render_status_note(
+                'Remote changes',
+                'Local version state is not initialized yet, so remote changes since the last sync are unavailable.',
+            ))
+        else:
+            if local_version_missing_remote:
+                remote_base = remote_versions[0].filemap if len(remote_versions) > 0 else local_version.filemap
+                remote_subtitle = 'The local synced version is missing on remote, so the available remote history is shown instead.'
+            else:
+                remote_base = local_version.filemap
+                remote_subtitle = 'Changes detected on remote since the current local synced version.'
+            remote_target = remote_versions[-1].filemap if len(remote_versions) > 0 else remote_base
+            remote_migration = remote_base.migrate_to(remote_target)
+            console.print(self._render_sync_plan(
+                'Remote changes',
+                remote_subtitle,
+                remote_migration,
+                border_style='cyan',
+            ))
+
+        console.print(self._render_sync_plan(
+            'Live local vs remote',
+            'Current filesystem differences between the local project and the remote project.',
+            live_diff,
+            border_style='magenta',
+        ))
 
     def _has_sync_commands(self) -> bool:
         return any([
