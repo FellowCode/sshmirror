@@ -1067,6 +1067,20 @@ class SSHMirror:
             filename=filename,
         )
 
+    async def get_current_synced_version_info(self) -> DiffVersionInfo | None:
+        local_version = await self._get_local_version()
+        if local_version is None:
+            return None
+
+        return DiffVersionInfo(
+            uid=local_version.uid,
+            label=self._format_version_label(local_version),
+            dt=local_version.dt.isoformat(),
+            author=local_version.author,
+            message=local_version.message,
+            filename=local_version.filename(),
+        )
+
     async def list_version_changes(self, base_version_uid: str, target_version_uid: str) -> list[DiffFileChange]:
         async with asyncssh.connect(**self._build_connect_kwargs(
             host=self.host,

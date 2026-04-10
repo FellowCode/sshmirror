@@ -80,6 +80,8 @@ Example:
    - a short git commit summary in one concise sentence or phrase
 - The git commit summary must use this exact shape: `{version} {description}`.
 - Example: `0.1.21 restore push and pull confirmation prompts`.
+- Present the git commit summary as copyable code text, not as a shell command.
+- Do not prefix it with `git commit -m` or any CLI wrapper.
 - Keep the git commit summary shorter than the changelog section and focused on the main user-visible outcome.
 - Do not invent technical details that are not reflected in the applied pending changes.
 

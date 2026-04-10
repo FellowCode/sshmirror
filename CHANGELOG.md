@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.23
+
+### Changed
+
+- Increased the interactive version history message column width to 40 characters for easier reading.
+- Returned Back from History version inspection to the same history page instead of resetting to the first page.
+- Returned Back from Versions compare to base and target selection while preserving both version list pages.
+- Highlighted the currently synced project version in interactive version lists.
+
+### Fixed
+
+- Made Ctrl+C in the interactive menu close sshmirror cleanly without showing an error.
+
 ## 0.1.22
 
 ### Added

@@ -1,3 +1,4 @@
+import argparse
 import os
 import re
 import subprocess
@@ -10,11 +11,11 @@ import unittest
 from asyncssh import SSHClientConnection
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
 from sshmirror._version import DIR_VERSION_FORMAT
-from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser
+from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_display_label, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser, main
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
@@ -395,7 +396,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
         self.assertEqual(
             _format_version_choice_label(version),
-            '12345 | 2026-04-09 12:34:56 UTC | -            | 12345678 | update                      ',
+            '12345 | 2026-04-09 12:34:56 UTC | -            | 12345678 | update                                  ',
         )
 
     def test_show_version_changes_cli_uses_paginated_version_selection(self):
@@ -430,7 +431,9 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             (versions_first_page, 25),
             (versions_first_page, 25),
             (versions_target_page, 15),
+            (versions_first_page, 25),
         ])
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
         mirror.list_version_changes_by_filenames = AsyncMock(return_value=file_changes)
         mirror.get_version_change_detail_by_range = AsyncMock(
             return_value=DiffDetail(
@@ -452,6 +455,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 'src/app.py',
                 'Back',
                 'Back',
+                'Back',
             ],
         ), patch('sshmirror.cli.clear_n_console_rows') as clear_rows_mock:
             asyncio.run(_show_version_changes_cli(mirror))
@@ -459,6 +463,77 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         clear_rows_mock.assert_called_once_with(1)
         mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-9.json', 'version-15.json')
         mirror.get_version_change_detail_by_range.assert_awaited_once_with('version-9.json', 'version-15.json', 9, 15, 'src/app.py')
+
+    def test_show_version_changes_cli_returns_to_base_selection_after_back(self):
+        base_version = DiffVersionInfo(
+            uid='25',
+            label='2026-04-09 12:25:00 UTC | 00000025 | user | msg-25',
+            dt='dt-25',
+            index=24,
+            filename='version-25.json',
+        )
+        target_version = DiffVersionInfo(
+            uid='30',
+            label='2026-04-09 12:30:00 UTC | 00000030 | user | msg-30',
+            dt='dt-30',
+            index=29,
+            filename='version-30.json',
+        )
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(return_value=([base_version], 40))
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
+
+        choose_mock = AsyncMock(side_effect=[base_version, target_version, base_version, target_version, None])
+        inspect_mock = AsyncMock()
+
+        with patch('sshmirror.cli._choose_version_interactively', choose_mock), \
+             patch('sshmirror.cli._inspect_version_range_cli', inspect_mock), \
+             patch('sshmirror.cli.clear_n_console_rows'):
+            asyncio.run(_show_version_changes_cli(mirror))
+
+        self.assertEqual(choose_mock.await_count, 5)
+        self.assertEqual(choose_mock.await_args_list[0].kwargs.get('initial_page'), 0)
+        self.assertEqual(choose_mock.await_args_list[1].kwargs.get('initial_page'), 0)
+        self.assertEqual(choose_mock.await_args_list[2].kwargs.get('initial_page'), 1)
+        self.assertEqual(choose_mock.await_args_list[3].kwargs.get('initial_page'), 0)
+        inspect_mock.assert_has_awaits([
+            call(mirror, base_version, target_version),
+            call(mirror, base_version, target_version),
+        ])
+
+    def test_show_version_changes_cli_reselects_base_after_target_back(self):
+        base_version = DiffVersionInfo(
+            uid='25',
+            label='2026-04-09 12:25:00 UTC | 00000025 | user | msg-25',
+            dt='dt-25',
+            index=24,
+            filename='version-25.json',
+        )
+        target_version = DiffVersionInfo(
+            uid='30',
+            label='2026-04-09 12:30:00 UTC | 00000030 | user | msg-30',
+            dt='dt-30',
+            index=29,
+            filename='version-30.json',
+        )
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(return_value=([base_version], 40))
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
+
+        choose_mock = AsyncMock(side_effect=[base_version, None, base_version, target_version, None])
+        inspect_mock = AsyncMock()
+
+        with patch('sshmirror.cli._choose_version_interactively', choose_mock), \
+             patch('sshmirror.cli._inspect_version_range_cli', inspect_mock), \
+             patch('sshmirror.cli.clear_n_console_rows'):
+            asyncio.run(_show_version_changes_cli(mirror))
+
+        self.assertEqual(choose_mock.await_count, 5)
+        self.assertEqual(choose_mock.await_args_list[0].kwargs.get('initial_page'), 0)
+        self.assertEqual(choose_mock.await_args_list[1].kwargs.get('initial_page'), 0)
+        self.assertEqual(choose_mock.await_args_list[2].kwargs.get('initial_page'), 1)
+        self.assertEqual(choose_mock.await_args_list[3].kwargs.get('initial_page'), 0)
+        inspect_mock.assert_awaited_once_with(mirror, base_version, target_version)
 
     def test_show_version_history_cli_compares_selected_version_with_previous(self):
         versions_page = [
@@ -478,6 +553,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         ]
         mirror = Mock()
         mirror.list_remote_versions_page = AsyncMock(return_value=(versions_page, 3))
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
         mirror.get_remote_version_info_by_index = AsyncMock(return_value=previous_version)
         mirror.list_version_changes_by_filenames = AsyncMock(return_value=file_changes)
         mirror.get_version_change_detail_by_range = AsyncMock(return_value=DiffDetail(
@@ -516,6 +592,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         )
         mirror = Mock()
         mirror.list_remote_versions_page = AsyncMock(return_value=([target_version], 3))
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
         mirror.get_remote_version_info_by_index = AsyncMock(return_value=previous_version)
 
         choose_mock = AsyncMock(side_effect=[target_version, None])
@@ -527,6 +604,39 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             asyncio.run(_show_version_history_cli(mirror))
 
         self.assertEqual(choose_mock.await_count, 2)
+        inspect_mock.assert_awaited_once_with(mirror, previous_version, target_version)
+
+    def test_show_version_history_cli_returns_to_same_page_after_back(self):
+        target_version = DiffVersionInfo(
+            uid='26',
+            label='2026-04-09 12:26:00 UTC | 00000026 | user | msg-26',
+            dt='dt-26',
+            index=25,
+            filename='version-26.json',
+        )
+        previous_version = DiffVersionInfo(
+            uid='25',
+            label='2026-04-09 12:25:00 UTC | 00000025 | user | msg-25',
+            dt='dt-25',
+            index=24,
+            filename='version-25.json',
+        )
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(return_value=([target_version], 40))
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
+        mirror.get_remote_version_info_by_index = AsyncMock(return_value=previous_version)
+
+        choose_mock = AsyncMock(side_effect=[target_version, None])
+        inspect_mock = AsyncMock()
+
+        with patch('sshmirror.cli._choose_version_interactively', choose_mock), \
+             patch('sshmirror.cli._inspect_version_range_cli', inspect_mock), \
+             patch('sshmirror.cli.clear_n_console_rows'):
+            asyncio.run(_show_version_history_cli(mirror))
+
+        self.assertEqual(choose_mock.await_count, 2)
+        self.assertEqual(choose_mock.await_args_list[0].kwargs.get('initial_page'), 0)
+        self.assertEqual(choose_mock.await_args_list[1].kwargs.get('initial_page'), 1)
         inspect_mock.assert_awaited_once_with(mirror, previous_version, target_version)
 
     def test_file_inspection_choice_shows_created_and_deleted_as_non_selectable(self):
@@ -542,7 +652,9 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             (base_versions_page, 3),
             (base_versions_page, 3),
             (target_versions_page, 1),
+            (base_versions_page, 3),
         ])
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
         mirror.list_version_changes_by_filenames = AsyncMock(return_value=[
             DiffFileChange(action='change', path='src/app.py'),
             DiffFileChange(action='create', path='src/new.py'),
@@ -557,7 +669,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         ))
         mirror.render_diff_detail = Mock()
 
-        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(base_versions_page[0]), _format_version_choice_label(target_versions_page[0]), 'src/app.py', 'Back', 'Back']) as prompt_mock, \
+        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(base_versions_page[0]), _format_version_choice_label(target_versions_page[0]), 'src/app.py', 'Back', 'Back', 'Back']) as prompt_mock, \
              patch('sshmirror.cli.console.clear') as clear_mock:
             asyncio.run(_show_version_changes_cli(mirror))
 
@@ -586,7 +698,9 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             (base_versions_page, 3),
             (base_versions_page, 3),
             (target_versions_page, 1),
+            (base_versions_page, 3),
         ])
+        mirror.get_current_synced_version_info = AsyncMock(return_value=None)
         mirror.list_version_changes_by_filenames = AsyncMock(return_value=[
             DiffFileChange(action='create', path='src/new.py'),
             DiffFileChange(action='delete', path='src/old.py'),
@@ -595,7 +709,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         mirror.render_diff_detail = Mock()
 
         with patch('sshmirror.cli._build_styled_file_change_choice', return_value=None), \
-             patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(base_versions_page[0]), _format_version_choice_label(target_versions_page[0]), 'Back']) as prompt_mock:
+               patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(base_versions_page[0]), _format_version_choice_label(target_versions_page[0]), 'Back', 'Back']) as prompt_mock:
             asyncio.run(_show_version_changes_cli(mirror))
 
         file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[1] == ['Back'])
@@ -706,8 +820,20 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
         choice_map = _build_version_choice_map(page_versions)
 
-        self.assertEqual(list(choice_map.keys())[0], '  123 | 2026-04-09 12:01:00 UTC | alice        | a        | first                       ')
-        self.assertEqual(list(choice_map.keys())[1], '  124 | 2026-04-09 12:02:00 UTC | bob          | b        | second                      ')
+        self.assertEqual(list(choice_map.keys())[0], '  123 | 2026-04-09 12:01:00 UTC | alice        | a        | first                                   ')
+        self.assertEqual(list(choice_map.keys())[1], '  124 | 2026-04-09 12:02:00 UTC | bob          | b        | second                                  ')
+
+    def test_build_version_choice_map_marks_current_synced_version(self):
+        current_version = DiffVersionInfo(uid='b', label='2026-04-09 12:02:00 UTC | bcdef123 | bob | second', dt='dt-b', index=123, author='bob', message='second')
+        page_versions = [
+            DiffVersionInfo(uid='a', label='2026-04-09 12:01:00 UTC | abcdef12 | alice | first', dt='dt-a', index=122, author='alice', message='first'),
+            current_version,
+        ]
+
+        choice_map = _build_version_choice_map(page_versions, current_version=current_version)
+
+        self.assertEqual(list(choice_map.keys())[0], '  123 | 2026-04-09 12:01:00 UTC | alice        | a        | first                                   ')
+        self.assertEqual(list(choice_map.keys())[1], '  124 | 2026-04-09 12:02:00 UTC | bob          | b        | second                                    ◀ current')
 
     def test_version_choice_label_uses_fixed_width_for_all_columns(self):
         version = DiffVersionInfo(
@@ -721,7 +847,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
         self.assertEqual(
             _format_version_choice_label(version),
-            '    8 | 2026-04-09 12:34:56 UTC | extraordi... | 12345678 | message that is much long...',
+            '    8 | 2026-04-09 12:34:56 UTC | extraordi... | 12345678 | message that is much longer than the ...',
         )
 
     def test_styled_version_choice_uses_fixed_author_column_width(self):
@@ -750,7 +876,23 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         self.assertIn(('class:magenta', 'bob         '), list(short_choice.title))
         self.assertIn(('class:magenta', 'verylongu...'), list(long_choice.title))
         self.assertIn(('class:cyan', 'abc12345'), list(short_choice.title))
-        self.assertIn(('', 'first                       '), list(short_choice.title))
+        self.assertIn(('', 'first                                   '), list(short_choice.title))
+
+    def test_styled_version_choice_marks_current_synced_version(self):
+        version = DiffVersionInfo(
+            uid='abc12345',
+            label='2026-04-09 12:01:00 UTC | abc12345 | bob | first',
+            dt='dt-a',
+            index=1,
+            author='bob',
+            message='first',
+        )
+
+        choice = _build_styled_version_choice(version, is_current=True)
+
+        self.assertIsNotNone(choice)
+        self.assertIn(('class:current_marker', '  ● current'), list(choice.title))
+        self.assertEqual(choice.value, _format_version_choice_display_label(version, current_version=version))
 
     def test_render_version_page_returns_choice_map(self):
         page_versions = [
@@ -1233,6 +1375,25 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             configured_args = _configure_interactive_args(args)
 
         self.assertTrue(configured_args.exit_requested)
+
+    def test_main_ctrl_c_exits_cleanly_without_error(self):
+        captured_handler = {}
+        configured_args = argparse.Namespace(exit_requested=True)
+
+        def capture_signal(_sig, handler):
+            captured_handler['handler'] = handler
+
+        with patch('sshmirror.cli.signal.signal', side_effect=capture_signal), \
+             patch('sshmirror.cli._configure_interactive_args', return_value=configured_args), \
+             patch('sshmirror.cli.console.print') as print_mock, \
+             patch('sshmirror.cli.sys.argv', ['sshmirror']):
+            result = main()
+
+        self.assertEqual(result, 0)
+        with self.assertRaises(SystemExit) as exit_info:
+            captured_handler['handler']()
+        self.assertEqual(exit_info.exception.code, 0)
+        print_mock.assert_not_called()
 
     def test_interactive_create_config_exits_after_creation(self):
         args = build_parser().parse_args([])
