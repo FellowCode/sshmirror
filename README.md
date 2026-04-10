@@ -18,15 +18,18 @@ Depending on project state, the menu can include:
 - `Create sshmirror.config.yml`
 - `Create sshmirror.ignore.txt`
 - `Initialization`
-- `Pull & Push`
+- `Sync local and remote`
 - `Status`
 - `View current changes`
-- `Versions` (`History`, `Compare`)
+- `Versions...`
+- `History` inside `Versions...`
+- `Compare` inside `Versions...`
 - `Pull only`
 - `Stash changes`
 - `Restore stashed changes`
-- `Discard all local changes`
-- `Discard selected files`
+- `Discard...`
+- `Discard all local changes` inside `Discard...`
+- `Discard selected files` inside `Discard...`
 - `Downgrade remote version`
 - `Test connection`
 - `Exit`
