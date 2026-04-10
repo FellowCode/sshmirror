@@ -16,7 +16,7 @@ from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_c
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
-from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo
+from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo, Difference, MigrationChanges
 from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from sshmirror.prompts import _questionary_available, prompt_choice, prompt_confirm
 from sshmirror.sshmirror import RemoteRollbackError, RemoteSyncError
@@ -525,7 +525,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         self.assertIn('deleted | src/old.py (not selectable)', file_prompt_call.args[0])
         mirror.get_version_change_detail_by_range.assert_not_called()
 
-    def test_current_changes_cli_skips_large_changed_files(self):
+    def test_current_changes_cli_matches_version_change_display(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             with working_directory(tmp_path):
@@ -545,13 +545,80 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 ))
                 mirror.render_diff_detail = Mock()
 
-                with patch('sshmirror.cli.prompt_choice', side_effect=['src/app.py', 'Back', 'Back']) as prompt_mock, \
+                with patch('sshmirror.cli._build_styled_file_change_choice', return_value=None), \
+                     patch('sshmirror.cli.prompt_choice', side_effect=['src/app.py', 'Back', 'Back']) as prompt_mock, \
                      patch('sshmirror.cli.console.clear') as clear_mock:
                     asyncio.run(_show_current_changes_cli(mirror))
 
-                file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[0] == 'Choose changed file to inspect')
+                file_prompt_call = next(call for call in prompt_mock.call_args_list if call.args[1] == ['src/app.py', 'Back'])
+                self.assertIn('changed | src/large.bin (not selectable)', file_prompt_call.args[0])
+                self.assertIn('changed | src/app.py', file_prompt_call.args[0])
+                self.assertIn('create on server | src/new.py (not selectable)', file_prompt_call.args[0])
                 self.assertEqual(file_prompt_call.args[1], ['src/app.py', 'Back'])
                 clear_mock.assert_called_once()
+
+    def test_scan_project_maps_with_progress_shows_live_updates(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                local_map = FileMap()
+                local_map.add('src/app.py', 'local-md5')
+                remote_map = FileMap()
+                remote_map.add('src/app.py', 'remote-md5')
+                dummy_conn = object.__new__(SSHClientConnection)
+                events: list[str] = []
+
+                class FakeLive:
+                    def __init__(self, *args, **kwargs):
+                        events.append('live_init')
+
+                    def __enter__(self):
+                        events.append('live_enter')
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        events.append('live_exit')
+                        return False
+
+                    def update(self, *args, **kwargs):
+                        events.append('live_update')
+
+                async def load_local(*args, **kwargs):
+                    await asyncio.sleep(0)
+                    return local_map
+
+                async def load_remote(*args, **kwargs):
+                    await asyncio.sleep(0)
+                    return remote_map
+
+                with patch('sshmirror.sshmirror.Live', FakeLive), \
+                     patch.object(mirror.filewatcher, 'get_filemap', new=AsyncMock(side_effect=load_local)), \
+                     patch.object(mirror, '_get_remote_map', new=AsyncMock(side_effect=load_remote)):
+                    scanned_local, scanned_remote = asyncio.run(
+                        mirror._scan_project_maps_with_progress(
+                            dummy_conn,
+                            local_reference_map=None,
+                            remote_reference_map=None,
+                            title='Verify',
+                            subtitle='Scanning projects',
+                        )
+                    )
+
+                self.assertIs(scanned_local, local_map)
+                self.assertIs(scanned_remote, remote_map)
+                self.assertEqual(events[:2], ['live_init', 'live_enter'])
+                self.assertIn('live_update', events)
+                self.assertEqual(events[-1], 'live_exit')
 
     def test_build_version_choice_map_uses_numeric_shortcuts(self):
         page_versions = [
@@ -1022,11 +1089,13 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         )
         labels = [label for label, _action in menu_items]
 
-        self.assertIn('Pull & Push', labels)
-        self.assertIn('Versions', labels)
+        self.assertIn('Sync local and remote', labels)
+        self.assertIn('Versions...', labels)
         self.assertNotIn('View version changes', labels)
         self.assertIn('Test connection', labels)
-        self.assertIn('Discard all local changes', labels)
+        self.assertIn('Discard...', labels)
+        self.assertNotIn('Discard all local changes', labels)
+        self.assertNotIn('Discard selected files', labels)
         self.assertNotIn('Force pull', labels)
         self.assertIn('Exit', labels)
 
@@ -1036,11 +1105,24 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         with patch('sshmirror.cli._find_default_cli_path', return_value='sshmirror.config.yml'), \
              patch('sshmirror.cli._is_sshmirror_initialized', return_value=True), \
              patch('sshmirror.cli._has_stashed_changes', return_value=False), \
-             patch('sshmirror.cli.prompt_choice', side_effect=['Versions', 'History']):
+             patch('sshmirror.cli.prompt_choice', side_effect=['Versions...', 'History']):
             configured_args = _configure_interactive_args(args)
 
         self.assertTrue(configured_args.version_history)
         self.assertFalse(configured_args.version_diff)
+
+    def test_interactive_discard_menu_can_open_discard_selected_files(self):
+        args = build_parser().parse_args([])
+
+        with patch('sshmirror.cli._find_default_cli_path', return_value='sshmirror.config.yml'), \
+             patch('sshmirror.cli._is_sshmirror_initialized', return_value=True), \
+             patch('sshmirror.cli._has_stashed_changes', return_value=False), \
+             patch('sshmirror.cli.prompt_choice', side_effect=['Discard...', 'Discard selected files']), \
+             patch('sshmirror.cli.prompt_discard_files', return_value=['src/app.py']):
+            configured_args = _configure_interactive_args(args)
+
+        self.assertEqual(configured_args.discard_files, ['src/app.py'])
+        self.assertFalse(configured_args.discard)
 
     def test_interactive_menu_exit_is_graceful(self):
         args = build_parser().parse_args([])
@@ -1403,20 +1485,20 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 class FakeLive:
                     def __init__(self, *args, **kwargs):
-                        pass
+                        events.append(f"live_init:{kwargs.get('transient', False)}")
 
                     def __enter__(self):
                         events.append('live_enter')
                         return self
 
                     def __exit__(self, exc_type, exc, tb):
+                        events.append('live_exit')
                         return False
 
                     def update(self, *args, **kwargs):
                         pass
 
-                with patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
-                     patch('sshmirror.sshmirror.Live', FakeLive), \
+                with patch('sshmirror.sshmirror.Live', FakeLive), \
                      patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
                      patch.object(mirror, '_prompt_version_message', side_effect=lambda: events.append('message') or 'feature sync'), \
                      patch.object(mirror, '_remote_create_downgrade', new=AsyncMock()), \
@@ -1430,7 +1512,10 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                      patch.object(mirror, '_save_prevstate', new=AsyncMock()):
                     asyncio.run(mirror._push(version, migration, dummy_conn))
 
-                self.assertEqual(events[:4], ['print', 'confirm', 'message', 'live_enter'])
+                self.assertEqual(
+                    events[:7],
+                    ['live_init:True', 'live_enter', 'confirm', 'live_exit', 'message', 'live_init:False', 'live_enter'],
+                )
 
     def test_pull_renders_preview_before_confirmation_and_live_updates(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1456,7 +1541,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 class FakeLive:
                     def __init__(self, *args, **kwargs):
-                        pass
+                        events.append(f"live_init:{kwargs.get('transient', False)}")
 
                     def __enter__(self):
                         events.append('live_enter')
@@ -1468,8 +1553,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                     def update(self, *args, **kwargs):
                         pass
 
-                with patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
-                     patch('sshmirror.sshmirror.Live', FakeLive), \
+                with patch('sshmirror.sshmirror.Live', FakeLive), \
                      patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
                      patch.object(mirror, '_run_commands', new=AsyncMock()), \
                      patch.object(mirror, '_download_files', new=AsyncMock()), \
@@ -1477,7 +1561,70 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                      patch.object(mirror, '_save_prevstate', new=AsyncMock()):
                     asyncio.run(mirror._pull([version], migration, None, dummy_conn))
 
-                self.assertEqual(events[:3], ['print', 'confirm', 'live_enter'])
+                self.assertEqual(
+                    events[:5],
+                    ['live_init:True', 'live_enter', 'confirm', 'live_init:False', 'live_enter'],
+                )
+
+    def test_downgrade_renders_preview_before_confirmation_and_live_updates(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                current_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 1, tzinfo=datetime.timezone.utc),
+                    uid='current-version',
+                    filemap=FileMap(),
+                )
+                target_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='target-version',
+                    filemap=FileMap(),
+                )
+                migration_changes = MigrationChanges(
+                    directories=Difference(changed=[], created=[], deleted=['old-dir']),
+                    files=Difference(changed=['src/app.py'], created=[], deleted=['src/old.py']),
+                )
+                dummy_conn = object.__new__(SSHClientConnection)
+                events: list[str] = []
+
+                class FakeLive:
+                    def __init__(self, *args, **kwargs):
+                        events.append(f"live_init:{kwargs.get('transient', False)}")
+
+                    def __enter__(self):
+                        events.append('live_enter')
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                    def update(self, *args, **kwargs):
+                        pass
+
+                with patch('sshmirror.sshmirror.Live', FakeLive), \
+                     patch.object(mirror, '_confirm', side_effect=lambda *args, **kwargs: events.append('confirm') or True), \
+                     patch('sshmirror.sshmirror.console.print', side_effect=lambda *args, **kwargs: events.append('print')), \
+                     patch.object(mirror, '_run_remote_script_from_project_root', new=AsyncMock()), \
+                     patch.object(mirror, 'force_pull', new=AsyncMock()) as force_pull_mock, \
+                     patch.object(mirror, '_maybe_restart_container', new=AsyncMock()) as restart_mock:
+                    asyncio.run(mirror._downgrade_remote(dummy_conn, current_version, target_version, migration_changes))
+
+                self.assertEqual(
+                    events[:5],
+                    ['live_init:True', 'live_enter', 'confirm', 'live_init:False', 'live_enter'],
+                )
+                force_pull_mock.assert_awaited_once_with(require_confirm=False)
+                restart_mock.assert_awaited_once()
 
     def test_run_skips_full_project_compare_after_push_without_sync_commands(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1539,6 +1686,73 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 push_mock.assert_awaited_once()
                 self.assertEqual(filemap_mock.await_count, 1)
+
+    def test_run_uses_downgrade_preview_flow(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                (tmp_path / 'existing.txt').write_text('before\n', encoding='utf-8')
+
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        downgrade=True,
+                    )
+                )
+
+                prevstate = FileMap()
+                prevstate.add('existing.txt', 'old-md5')
+                state = FileMap()
+                state.add('existing.txt', 'old-md5')
+
+                previous_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='previous-version',
+                    filemap=prevstate,
+                )
+                current_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 1, tzinfo=datetime.timezone.utc),
+                    uid='current-version',
+                    filemap=state,
+                )
+                migration_changes = MigrationChanges(
+                    directories=Difference(changed=[], created=['new-dir'], deleted=[]),
+                    files=Difference(changed=['existing.txt'], created=[], deleted=[]),
+                )
+
+                class DummyConn:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                filemap_mock = AsyncMock(return_value=state)
+
+                with patch('sshmirror.sshmirror.asyncssh.connect', return_value=DummyConn()), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows'), \
+                     patch.object(mirror, '_validate_conflicts', new=AsyncMock(return_value=True)), \
+                     patch.object(mirror, '_sync_ignore_file_before_transfer', new=AsyncMock()), \
+                     patch.object(mirror, '_load_or_create_prevstate', new=AsyncMock(return_value=prevstate)), \
+                     patch.object(mirror.filewatcher, 'get_filemap', new=filemap_mock), \
+                     patch.object(mirror, '_remote_mk_dir', new=AsyncMock()), \
+                     patch.object(mirror, '_get_local_version', new=AsyncMock(return_value=current_version)), \
+                     patch.object(mirror, '_get_remote_versions_stack', new=AsyncMock(return_value=[previous_version, current_version])), \
+                     patch.object(mirror, '_get_remote_migration_changes', new=AsyncMock(return_value=migration_changes)), \
+                     patch.object(mirror, '_downgrade_remote', new=AsyncMock()) as downgrade_mock:
+                    asyncio.run(mirror.run())
+
+                downgrade_mock.assert_awaited_once()
+                self.assertIs(downgrade_mock.await_args.args[1], current_version)
+                self.assertIs(downgrade_mock.await_args.args[2], previous_version)
+                self.assertEqual(
+                    downgrade_mock.await_args.args[3].model_dump(),
+                    migration_changes.inversed().model_dump(),
+                )
 
     def test_run_prompts_restart_container_after_push_when_full_compare_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

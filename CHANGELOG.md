@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.20
+
+### Changed
+
+- Reworked downgrade to match the push and pull preview flow with clearer confirmation, live status updates, and post-downgrade sync.
+- Updated View current changes to use the same file-change list format and selection flow as version comparison.
+- Renamed the interactive Pull & Push menu action to Sync local and remote for clearer CLI wording.
+- Grouped discard actions into a Discard submenu and marked submenu items with `...` in the interactive CLI.
+- Added a live progress indicator during full local/remote project scans so long verification steps no longer look stuck.
+
+### Fixed
+
+- Cleared the preview table before showing live push and pull progress so sync runs no longer leave duplicate tables in the terminal.
+- Kept the entered push version description visible in the terminal after confirmation instead of clearing it with the preview screen.
+
 ## 0.1.19
 
 ### Fixed

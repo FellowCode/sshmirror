@@ -11,12 +11,14 @@ import hashlib
 import yaml
 import typing
 import datetime
+import time
 import subprocess
 import uuid
 import aiofiles
 import pathlib
 import shutil
 import aioshutil
+from types import SimpleNamespace
 from rich import print
 from rich.console import Console
 from rich.console import Group
@@ -443,7 +445,7 @@ class SSHMirror:
         return before_text, after_text
 
     @staticmethod
-    def _build_sync_action_rows(migration: Migration, conflicts: Conflicts | None = None) -> list[tuple[str, str, str, str]]:
+    def _build_sync_action_rows(migration: typing.Any, conflicts: Conflicts | None = None) -> list[tuple[str, str, str, str]]:
         rows: list[tuple[str, str, str, str]] = []
 
         for path in migration.dirs.created:
@@ -458,6 +460,10 @@ class SSHMirror:
             rows.append(('-', 'delete', path, 'conflict' if conflicts and path in conflicts else 'pending'))
 
         return rows
+
+    @staticmethod
+    def _migration_changes_to_sync_plan(migration_changes: MigrationChanges):
+        return SimpleNamespace(dirs=migration_changes.directories, files=migration_changes.files)
 
     @staticmethod
     def _sync_action_style(action_name: str) -> str:
@@ -486,7 +492,7 @@ class SSHMirror:
     @classmethod
     def _build_sync_plan_state(
         cls,
-        migration: Migration,
+        migration: typing.Any,
         conflicts: Conflicts | None = None,
     ) -> list[dict[str, str]]:
         return [
@@ -504,7 +510,7 @@ class SSHMirror:
         cls,
         title: str,
         subtitle: str,
-        migration: Migration,
+        migration: typing.Any,
         *,
         conflicts: Conflicts | None = None,
         border_style: str = 'cyan',
@@ -555,10 +561,10 @@ class SSHMirror:
     @classmethod
     def _update_sync_plan_status(
         cls,
-        live: Live,
+        live: typing.Any,
         title: str,
         subtitle: str,
-        migration: Migration,
+        migration: typing.Any,
         plan_state: list[dict[str, str]],
         action_name: str,
         path: str,
@@ -587,10 +593,10 @@ class SSHMirror:
     @classmethod
     def _mark_sync_plan_paths(
         cls,
-        live: Live,
+        live: typing.Any,
         title: str,
         subtitle: str,
-        migration: Migration,
+        migration: typing.Any,
         plan_state: list[dict[str, str]],
         paths: list[str],
         status: str,
@@ -792,9 +798,84 @@ class SSHMirror:
         assert detail.after_text is not None
         self._print_unified_diff(detail.path, detail.before_text, detail.after_text, detail.before_label, detail.after_label)
 
+    @staticmethod
+    def _render_project_scan_progress(
+        title: str,
+        subtitle: str,
+        steps: list[dict[str, str]],
+        started_at: float,
+        border_style: str = 'yellow',
+    ) -> Panel:
+        table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        table.add_column('Step', style='cyan')
+        table.add_column('Status', style='green', width=18)
+
+        elapsed = time.monotonic() - started_at
+        for step in steps:
+            status = step['status']
+            if status == 'running':
+                status_text = f'working {elapsed:.1f}s'
+            elif status == 'done':
+                status_text = 'done'
+            elif status == 'failed':
+                status_text = 'failed'
+            else:
+                status_text = status
+            table.add_row(step['label'], status_text)
+
+        return Panel(Group(Text(subtitle, style='dim'), table), title=title, border_style=border_style)
+
+    async def _scan_project_maps_with_progress(
+        self,
+        conn: SSHClientConnection,
+        *,
+        local_reference_map: FileMap | None,
+        remote_reference_map: FileMap | None,
+        title: str,
+        subtitle: str,
+        border_style: str = 'yellow',
+    ) -> tuple[FileMap, FileMap]:
+        started_at = time.monotonic()
+        steps = [
+            {'label': 'Scan local project', 'status': 'running'},
+            {'label': 'Scan remote project', 'status': 'running'},
+        ]
+        local_task = asyncio.create_task(self.filewatcher.get_filemap(reference_map=local_reference_map))
+        remote_task = asyncio.create_task(self._get_remote_map(conn, reference_map=remote_reference_map))
+        task_indexes = {
+            local_task: 0,
+            remote_task: 1,
+        }
+
+        with Live(
+            self._render_project_scan_progress(title, subtitle, steps, started_at, border_style=border_style),
+            console=console,
+            refresh_per_second=8,
+            transient=True,
+        ) as live:
+            pending = set(task_indexes.keys())
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    step_index = task_indexes[task]
+                    if task.cancelled() or task.exception() is not None:
+                        steps[step_index]['status'] = 'failed'
+                        live.update(self._render_project_scan_progress(title, subtitle, steps, started_at, border_style=border_style))
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        exception = task.exception()
+                        if exception is not None:
+                            raise exception
+                        raise RuntimeError(f'Project scan task failed: {steps[step_index]["label"]}')
+                    steps[step_index]['status'] = 'done'
+
+                live.update(self._render_project_scan_progress(title, subtitle, steps, started_at, border_style=border_style))
+
+        return local_task.result(), remote_task.result()
+
     async def list_current_changes(self) -> list[DiffFileChange]:
         prevstate = await self._load_prevstate()
-        local_state = await self.filewatcher.get_filemap(reference_map=prevstate)
         async with asyncssh.connect(**self._build_connect_kwargs(
             host=self.host,
             port=self.port,
@@ -807,7 +888,13 @@ class SSHMirror:
             except ErrorLocalVersion:
                 remote_versions = await self._get_remote_versions_stack(conn)
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
-            remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
+            local_state, remote_map = await self._scan_project_maps_with_progress(
+                conn,
+                local_reference_map=prevstate,
+                remote_reference_map=remote_reference,
+                title='Current Changes',
+                subtitle='Scanning local and remote projects before building the diff.',
+            )
 
         migration = local_state.migrate_to(remote_map)
         return self._build_file_actions_with_entries(
@@ -820,7 +907,6 @@ class SSHMirror:
 
     async def get_current_change_detail(self, path: str) -> DiffDetail:
         prevstate = await self._load_prevstate()
-        local_state = await self.filewatcher.get_filemap(reference_map=prevstate)
         async with asyncssh.connect(**self._build_connect_kwargs(
             host=self.host,
             port=self.port,
@@ -833,7 +919,13 @@ class SSHMirror:
             except ErrorLocalVersion:
                 remote_versions = await self._get_remote_versions_stack(conn)
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
-            remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
+            local_state, remote_map = await self._scan_project_maps_with_progress(
+                conn,
+                local_reference_map=prevstate,
+                remote_reference_map=remote_reference,
+                title='Current Changes',
+                subtitle='Scanning local and remote projects before loading the diff detail.',
+            )
 
             migration = local_state.migrate_to(remote_map)
             file_action = self._find_file_action(
@@ -1858,24 +1950,11 @@ class SSHMirror:
                     console.print('Before downgrade push or discard changes!', style='red')
                     return
                 versions = await self._get_remote_versions_stack(conn, last_n=2)
-                migration_changes = await self._get_remote_migration_changes(conn, versions[-1])
-                migration_changes.inversed().print()
-                if not self._confirm(
-                    f'Do you want switch to version {versions[-2].dt.isoformat()} UTC?',
-                    'Downgrade cancelled by user',
-                ):
+                if len(versions) < 2:
+                    console.print('Downgrade requires at least two remote versions', style='yellow')
                     return
-
-                await self._run_remote_script_from_project_root(
-                    conn,
-                    f'{self.migrations_directory}/{versions[-1].name()}/_downgrade.sh',
-                    f'Failed to downgrade to previous version from {versions[-1].uid}',
-                )
-                try:
-                    os.remove(f'{self.versions_directory}/{versions[-1].filename()}')
-                except FileNotFoundError:
-                    pass
-                await self.force_pull()
+                migration_changes = await self._get_remote_migration_changes(conn, versions[-1])
+                await self._downgrade_remote(conn, versions[-1], versions[-2], migration_changes.inversed())
                 return
             
             # Check file sizes
@@ -1971,9 +2050,12 @@ class SSHMirror:
 
             console.print('Compare remote and local projects...', style='yellow')
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
-            local_map, remote_map = await asyncio.gather(
-                self.filewatcher.get_filemap(reference_map=state),
-                self._get_remote_map(conn, reference_map=remote_reference),
+            local_map, remote_map = await self._scan_project_maps_with_progress(
+                conn,
+                local_reference_map=state,
+                remote_reference_map=remote_reference,
+                title='Full Project Verification',
+                subtitle='Scanning local and remote projects to confirm they are fully synchronized.',
             )
             migration = local_map.migrate_to(remote_map)
             clear_n_console_rows(1)
@@ -2024,9 +2106,12 @@ class SSHMirror:
             console.print('Get local and remote states...', style='yellow')
             prevstate = await self._load_prevstate()
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else None
-            local_map, remote_map = await asyncio.gather(
-                self.filewatcher.get_filemap(reference_map=prevstate),
-                self._get_remote_map(conn, reference_map=remote_reference),
+            local_map, remote_map = await self._scan_project_maps_with_progress(
+                conn,
+                local_reference_map=prevstate,
+                remote_reference_map=remote_reference,
+                title='Force Pull',
+                subtitle='Scanning local and remote projects before overwriting local state.',
             )
             clear_n_console_rows(1)
             console.print('Remove local versions...', style='yellow')
@@ -2110,11 +2195,15 @@ class SSHMirror:
             plan_state=plan_state,
         )
 
-        console.print(preview_panel)
-
         if require_confirm:
-            if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
-                raise UserAbort('Pull cancelled by user')
+            with Live(
+                preview_panel,
+                console=console,
+                transient=True,
+                auto_refresh=False,
+            ):
+                if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
+                    raise UserAbort('Pull cancelled by user')
 
         with Live(
             preview_panel,
@@ -2169,6 +2258,88 @@ class SSHMirror:
             await self._save_prevstate(remote_versions[-1].filemap)
 
             await self._run_commands(self.commands.after_pull, migration, conn)
+
+    async def _downgrade_remote(
+        self,
+        conn: SSHClientConnection,
+        current_version: DirVersion,
+        target_version: DirVersion,
+        migration_changes: MigrationChanges,
+    ) -> None:
+        title = 'Downgrade'
+        subtitle = f'These changes will revert the remote project to {target_version.uid[:8]}.'
+        border_style = 'yellow'
+        preview_migration = self._migration_changes_to_sync_plan(migration_changes)
+        plan_state = self._build_sync_plan_state(preview_migration)
+        preview_panel = self._render_sync_plan(
+            title,
+            subtitle,
+            preview_migration,
+            border_style=border_style,
+            plan_state=plan_state,
+        )
+
+        with Live(
+            preview_panel,
+            console=console,
+            transient=True,
+            auto_refresh=False,
+        ):
+            if not self._confirm(
+                f'Apply downgrade to version {target_version.dt.isoformat()} UTC?',
+                'Downgrade cancelled by user',
+            ):
+                raise UserAbort('Downgrade cancelled by user')
+
+        all_paths = migration_changes.directories.all() + migration_changes.files.all()
+        with Live(preview_panel, console=console, refresh_per_second=8) as live:
+            if len(all_paths) > 0:
+                self._mark_sync_plan_paths(
+                    live,
+                    title,
+                    subtitle,
+                    preview_migration,
+                    plan_state,
+                    all_paths,
+                    'syncing',
+                    border_style=border_style,
+                )
+
+            try:
+                await self._run_remote_script_from_project_root(
+                    conn,
+                    f'{self.migrations_directory}/{current_version.name()}/_downgrade.sh',
+                    f'Failed to downgrade to previous version from {current_version.uid}',
+                )
+            except Exception:
+                if len(all_paths) > 0:
+                    self._mark_sync_plan_paths(
+                        live,
+                        title,
+                        subtitle,
+                        preview_migration,
+                        plan_state,
+                        all_paths,
+                        'failed',
+                        border_style=border_style,
+                    )
+                raise
+
+            if len(all_paths) > 0:
+                self._mark_sync_plan_paths(
+                    live,
+                    title,
+                    subtitle,
+                    preview_migration,
+                    plan_state,
+                    all_paths,
+                    'done',
+                    border_style=border_style,
+                )
+
+        console.print('Sync local project to downgraded remote version...', style='yellow')
+        await self.force_pull(require_confirm=False)
+        await self._maybe_restart_container()
         
     async def _push(self, local_version: DirVersion, migration: Migration, conn: SSHClientConnection):
         title = 'Push'
@@ -2183,10 +2354,14 @@ class SSHMirror:
             plan_state=plan_state,
         )
 
-        console.print(preview_panel)
-
-        if not self._confirm('Apply push changes?', 'Push cancelled by user'):
-            raise UserAbort('Push cancelled by user')
+        with Live(
+            preview_panel,
+            console=console,
+            transient=True,
+            auto_refresh=False,
+        ):
+            if not self._confirm('Apply push changes?', 'Push cancelled by user'):
+                raise UserAbort('Push cancelled by user')
 
         local_version.message = self._prompt_version_message()
 

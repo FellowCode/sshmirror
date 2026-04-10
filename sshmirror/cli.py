@@ -144,6 +144,10 @@ def _menu_item(label: str, action: str) -> tuple[str, str]:
     return label, action
 
 
+def _submenu_item(label: str, action: str) -> tuple[str, str]:
+    return f'{label}...', action
+
+
 def _build_interactive_menu_items(
     *,
     has_config: bool,
@@ -155,14 +159,13 @@ def _build_interactive_menu_items(
         menu_items: list[tuple[str, str]] = []
     elif initialized:
         menu_items = [
-            _menu_item('Pull & Push', 'Pull & Push'),
+            _menu_item('Sync local and remote', 'Sync local and remote'),
             _menu_item('Status', 'Status'),
             _menu_item('View current changes', 'View current changes'),
-            _menu_item('Versions', 'Versions'),
+            _submenu_item('Versions', 'Versions'),
             _menu_item('Pull only', 'Pull only'),
             _menu_item('Restore stashed changes', 'Restore stashed changes') if has_stash else _menu_item('Stash changes', 'Stash changes'),
-            _menu_item('Discard all local changes', 'Discard all local changes'),
-            _menu_item('Discard selected files', 'Discard selected files'),
+            _submenu_item('Discard', 'Discard'),
             _menu_item('Downgrade remote version', 'Downgrade remote version'),
             _menu_item('Test connection', 'Test connection'),
         ]
@@ -240,14 +243,18 @@ def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
                 args.version_history = True
             else:
                 args.version_diff = True
+        elif action == 'Discard':
+            discard_action = prompt_choice('Discard:', ['Discard all local changes', 'Discard selected files', 'Back'], default='Back')
+            if discard_action == 'Back':
+                continue
+            if discard_action == 'Discard all local changes':
+                args.discard = True
+            else:
+                args.discard_files = prompt_discard_files()
         elif action == 'Stash changes':
             args.stash_changes = True
         elif action == 'Restore stashed changes':
             args.restore_stash = True
-        elif action == 'Discard all local changes':
-            args.discard = True
-        elif action == 'Discard selected files':
-            args.discard_files = prompt_discard_files()
         elif action == 'Downgrade remote version':
             args.downgrade = True
         elif action == 'Test connection':
@@ -299,22 +306,11 @@ async def _show_current_changes_cli(mirror: SSHMirror) -> None:
     if len(file_actions) == 0:
         console.print('No current file differences between local and remote', style='yellow')
         return
-
-    while True:
-        inspectable_actions = [item for item in file_actions if item.action == 'change' and item.inspectable]
-        if len(inspectable_actions) == 0:
-            console.print('No changed files available for textual inspection', style='yellow')
-            return
-
-        choice_map = OrderedDict((item.path, item) for item in inspectable_actions)
-        choice = prompt_choice('Choose changed file to inspect', list(choice_map.keys()) + ['Back'])
-        if choice == 'Back':
-            return
-
-        detail = await mirror.get_current_change_detail(choice_map[choice].path)
-        mirror.render_diff_detail(detail)
-        prompt_choice('Diff actions', ['Back'], default='Back')
-        console.clear()
+    await _inspect_file_changes_cli(
+        file_actions,
+        detail_loader=mirror.get_current_change_detail,
+        detail_renderer=mirror.render_diff_detail,
+    )
 
 
 def _build_version_page_choices(total_versions: int, page: int, page_size: int = VERSION_PAGE_SIZE) -> tuple[bool, bool, int]:
@@ -615,6 +611,25 @@ async def _inspect_version_range_cli(
         console.print('No file changes between selected versions', style='yellow')
         return
 
+    await _inspect_file_changes_cli(
+        file_actions,
+        detail_loader=lambda path: mirror.get_version_change_detail_by_range(
+            base_version.filename,
+            target_version.filename,
+            base_version.index,
+            target_version.index,
+            path,
+        ),
+        detail_renderer=mirror.render_diff_detail,
+    )
+
+
+async def _inspect_file_changes_cli(
+    file_actions: list[DiffFileChange],
+    *,
+    detail_loader,
+    detail_renderer,
+) -> None:
     while True:
         inspectable_actions = [item for item in file_actions if item.action == 'change' and item.inspectable]
         choice_map = OrderedDict((item.path, item) for item in inspectable_actions)
@@ -646,14 +661,8 @@ async def _inspect_version_range_cli(
         if choice == 'Back':
             return
 
-        detail = await mirror.get_version_change_detail_by_range(
-            base_version.filename,
-            target_version.filename,
-            base_version.index,
-            target_version.index,
-            choice_map[choice].path,
-        )
-        mirror.render_diff_detail(detail)
+        detail = await detail_loader(choice_map[choice].path)
+        detail_renderer(detail)
         prompt_choice('Diff actions', ['Back'], default='Back')
         console.clear()
 
