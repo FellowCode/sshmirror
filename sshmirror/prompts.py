@@ -132,17 +132,24 @@ def prompt_confirm(prompt: str) -> bool:
     return _fallback_confirm_prompt(prompt)
 
 
-def prompt_text(prompt: str, default: str = 'update') -> str:
-    result = _questionary_ask(
-        lambda: questionary.text(prompt, default=default),
-        'Interactive questionary input is unavailable, fallback to plain input',
-    )
-    if result is not _PROMPT_FALLBACK:
-        value = result.strip()
-        return value or default
+def prompt_text(prompt: str, default: str | None = 'update') -> str:
+    while True:
+        result = _questionary_ask(
+            lambda: questionary.text(prompt, default=default or ''),
+            'Interactive questionary input is unavailable, fallback to plain input',
+        )
+        if result is not _PROMPT_FALLBACK:
+            value = result.strip()
+        else:
+            suffix = f' [{default}]' if default else ''
+            value = _read_plain_input(f'{prompt}{suffix}: ').strip()
 
-    value = _read_plain_input(f'{prompt} [{default}]: ').strip()
-    return value or default
+        if value != '':
+            return value
+        if default is not None:
+            return default
+
+        console.print('Value is required', style='yellow')
 
 
 def prompt_secret(prompt: str) -> str:

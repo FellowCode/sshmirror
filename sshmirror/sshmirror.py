@@ -1,6 +1,7 @@
 import asyncssh
 from asyncssh import SSHClientConnection, SFTPClient
 import asyncio
+from collections.abc import Callable
 import difflib
 import os
 import re
@@ -17,6 +18,7 @@ import aioshutil
 from rich import print
 from rich.console import Console
 from rich.console import Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -43,6 +45,14 @@ console = Console()
 STASH_DIRECTORY = '.sshmirror/stash/current'
 STASH_FILES_DIRECTORY = f'{STASH_DIRECTORY}/files'
 STASH_METADATA_FILE = f'{STASH_DIRECTORY}/metadata.json'
+
+
+class RemoteSyncError(RuntimeError):
+    pass
+
+
+class RemoteRollbackError(RemoteSyncError):
+    pass
 
 
 def _is_sshmirror_initialized() -> bool:
@@ -330,7 +340,7 @@ class SSHMirror:
     def _normalize_version_message(message: str | None) -> str:
         normalized = (message or '').strip()
         if normalized == '':
-            return 'update'
+            raise ValueError('Version description is required')
         if len(normalized) > SSHMirror.VERSION_MESSAGE_MAX_LENGTH:
             raise ValueError(
                 f'Version description must be at most {SSHMirror.VERSION_MESSAGE_MAX_LENGTH} characters long'
@@ -339,11 +349,11 @@ class SSHMirror:
 
     def _prompt_version_message(self) -> str:
         if self.callbacks.text is None:
-            return 'update'
+            raise UserAbort('Version description is required')
         return self._normalize_version_message(
             self.callbacks.text(
                 f'Version description (max {self.VERSION_MESSAGE_MAX_LENGTH} chars)',
-                'update',
+                None,
             )
         )
 
@@ -457,6 +467,36 @@ class SSHMirror:
             return 'magenta bold'
         return 'yellow bold'
 
+    @staticmethod
+    def _sync_status_style(status: str) -> str:
+        styles = {
+            'pending': 'dim',
+            'syncing': 'cyan bold',
+            'done': 'green bold',
+            'preserved': 'yellow bold',
+            'skipped': 'yellow',
+            'conflict': 'orange_red1 bold',
+            'failed': 'red bold',
+            'clean': 'dim',
+        }
+        return styles.get(status, 'dim')
+
+    @classmethod
+    def _build_sync_plan_state(
+        cls,
+        migration: Migration,
+        conflicts: Conflicts | None = None,
+    ) -> list[dict[str, str]]:
+        return [
+            {
+                'marker': marker,
+                'action': action_name,
+                'path': path,
+                'status': status,
+            }
+            for marker, action_name, path, status in cls._build_sync_action_rows(migration, conflicts)
+        ]
+
     @classmethod
     def _render_sync_plan(
         cls,
@@ -466,7 +506,8 @@ class SSHMirror:
         *,
         conflicts: Conflicts | None = None,
         border_style: str = 'cyan',
-    ) -> None:
+        plan_state: list[dict[str, str]] | None = None,
+    ):
         summary = Table.grid(padding=(0, 2))
         summary.add_column(style='dim', justify='right')
         summary.add_column()
@@ -480,30 +521,100 @@ class SSHMirror:
         details.add_column('Path', ratio=1, overflow='fold')
         details.add_column('Status', width=12, no_wrap=True)
 
-        for marker, action_name, path, status in cls._build_sync_action_rows(migration, conflicts):
+        rendered_state = plan_state if plan_state is not None else cls._build_sync_plan_state(migration, conflicts)
+
+        for row in rendered_state:
+            marker = row['marker']
+            action_name = row['action']
+            path = row['path']
+            status = row['status']
             details.add_row(
                 Text(f' {marker} {action_name.upper()} ', style=cls._sync_action_style(action_name)),
                 Text(path, style='white'),
-                Text(status, style='orange_red1' if status == 'conflict' else 'dim'),
+                Text(status, style=cls._sync_status_style(status)),
             )
 
         if details.row_count == 0:
             details.add_row(Text(' OK ', style='green bold'), Text('No changes', style='dim'), Text('clean', style='dim'))
 
-        console.print(
-            Panel(
-                Group(
-                    Text(subtitle, style='yellow'),
-                    Text(''),
-                    summary,
-                    Text(''),
-                    details,
-                ),
-                title=title,
-                border_style=border_style,
-                expand=True,
-            )
+        return Panel(
+            Group(
+                Text(subtitle, style='yellow'),
+                Text(''),
+                summary,
+                Text(''),
+                details,
+            ),
+            title=title,
+            border_style=border_style,
+            expand=True,
         )
+
+    @classmethod
+    def _update_sync_plan_status(
+        cls,
+        live: Live,
+        title: str,
+        subtitle: str,
+        migration: Migration,
+        plan_state: list[dict[str, str]],
+        action_name: str,
+        path: str,
+        status: str,
+        *,
+        conflicts: Conflicts | None = None,
+        border_style: str = 'cyan',
+    ) -> None:
+        for row in plan_state:
+            if row['action'] == action_name and row['path'] == path:
+                row['status'] = status
+                break
+
+        live.update(
+            cls._render_sync_plan(
+                title,
+                subtitle,
+                migration,
+                conflicts=conflicts,
+                border_style=border_style,
+                plan_state=plan_state,
+            ),
+            refresh=True,
+        )
+
+    @classmethod
+    def _mark_sync_plan_paths(
+        cls,
+        live: Live,
+        title: str,
+        subtitle: str,
+        migration: Migration,
+        plan_state: list[dict[str, str]],
+        paths: list[str],
+        status: str,
+        *,
+        conflicts: Conflicts | None = None,
+        border_style: str = 'cyan',
+    ) -> None:
+        path_set = set(paths)
+        updated = False
+        for row in plan_state:
+            if row['path'] in path_set:
+                row['status'] = status
+                updated = True
+
+        if updated:
+            live.update(
+                cls._render_sync_plan(
+                    title,
+                    subtitle,
+                    migration,
+                    conflicts=conflicts,
+                    border_style=border_style,
+                    plan_state=plan_state,
+                ),
+                refresh=True,
+            )
 
     @classmethod
     def _render_diff_row(
@@ -825,6 +936,36 @@ class SSHMirror:
             )
 
         return page_infos, total_versions
+
+    async def get_remote_version_info_by_index(self, index: int) -> DiffVersionInfo | None:
+        if index < 0:
+            return None
+
+        async with asyncssh.connect(**self._build_connect_kwargs(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth_kwargs=self.auth_kwargs,
+        )) as conn:
+            selected_filenames = await self._get_remote_version_filenames_in_range(conn, index, index)
+            if len(selected_filenames) == 0:
+                return None
+            versions = await self._load_remote_versions_by_filenames(conn, selected_filenames)
+
+        if len(versions) == 0:
+            return None
+
+        version = versions[0]
+        filename = selected_filenames[0]
+        return DiffVersionInfo(
+            uid=version.uid,
+            label=self._format_version_label(version),
+            dt=version.dt.isoformat(),
+            author=version.author,
+            message=version.message,
+            index=index,
+            filename=filename,
+        )
 
     async def list_version_changes(self, base_version_uid: str, target_version_uid: str) -> list[DiffFileChange]:
         async with asyncssh.connect(**self._build_connect_kwargs(
@@ -1247,6 +1388,36 @@ class SSHMirror:
     def _command_error_text(result) -> str:
         return result.stderr.strip() or result.stdout.strip() or 'command failed'
 
+    async def _run_remote_checked(self, conn: SSHClientConnection, command: str, error_message: str) -> str:
+        result = await conn.run(command, check=False)
+        if result.exit_status != 0:
+            raise RemoteSyncError(f'{error_message}: {self._command_error_text(result)}')
+        return result.stdout
+
+    async def _rollback_remote_push(self, conn: SSHClientConnection, version: DirVersion) -> None:
+        try:
+            await self._run_remote_script_from_project_root(
+                conn,
+                f'{self.migrations_directory}/{version.name()}/_downgrade.sh',
+                f'Failed to rollback remote changes for version {version.uid}',
+            )
+        except RemoteSyncError as exc:
+            raise RemoteRollbackError(str(exc)) from exc
+
+    async def _run_remote_script_from_project_root(
+        self,
+        conn: SSHClientConnection,
+        relative_script_path: str,
+        error_message: str,
+    ) -> None:
+        remote_root = self.remotedir.rstrip('/') or '/'
+        script_path = relative_script_path.replace('\\', '/')
+        await self._run_remote_checked(
+            conn,
+            f'cd {shlex.quote(remote_root)} && sh {shlex.quote(script_path)}',
+            error_message,
+        )
+
     async def _run_restart_container_diagnostics(self, conn: SSHClientConnection) -> None:
         docker_check = await conn.run('command -v docker >/dev/null 2>&1', check=False)
         if docker_check.exit_status != 0:
@@ -1543,6 +1714,14 @@ class SSHMirror:
             console.print('  projects are equal', style='green')
         else:
             live_diff.print_actions(prefix='  diff > ')
+
+    def _has_sync_commands(self) -> bool:
+        return any([
+            len(self.commands.before_pull) > 0,
+            len(self.commands.after_pull) > 0,
+            len(self.commands.before_push) > 0,
+            len(self.commands.after_push) > 0,
+        ])
             
     async def run(self):
         self._refresh_ignore_file_path()
@@ -1590,7 +1769,11 @@ class SSHMirror:
                 ):
                     return
 
-                await conn.run(f'sh {self.remotedir}{self.migrations_directory}/{versions[-1].name()}/_downgrade.sh')
+                await self._run_remote_script_from_project_root(
+                    conn,
+                    f'{self.migrations_directory}/{versions[-1].name()}/_downgrade.sh',
+                    f'Failed to downgrade to previous version from {versions[-1].uid}',
+                )
                 try:
                     os.remove(f'{self.versions_directory}/{versions[-1].filename()}')
                 except FileNotFoundError:
@@ -1656,6 +1839,8 @@ class SSHMirror:
                     version = self._create_version(state)
                     await self._push(version, migration, conn)
                 return
+
+            pushed_version: DirVersion | None = None
             
             if len(remote_versions) > 1:
                 # Remote changed by other contributer
@@ -1676,6 +1861,14 @@ class SSHMirror:
                 if len(remote_versions) > 0 and version.dt <= remote_versions[-1].dt:
                     raise ValueError(f'Push version timestamp less than last version timestamp on remote ({version.dt} < {remote_versions[-1].dt})')
                 await self._push(version, local_migration, conn)
+                pushed_version = version
+                local_version = version
+                remote_versions = [version]
+
+            if pushed_version is not None and not self._has_sync_commands():
+                console.print('Skip full remote/local verification after push: sync state is already known', style='dim')
+                console.print('Projects are equal', style='green')
+                return
 
             console.print('Compare remote and local projects...', style='yellow')
             remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
@@ -1817,77 +2010,128 @@ class SSHMirror:
 
     async def _pull(self, remote_versions: list[DirVersion], migration: Migration, conflicts: Conflicts | None, conn: SSHClientConnection,
                     ignore_version_exists=False, require_confirm: bool = True):
-        self._render_sync_plan(
-            'Pull',
-            'These changes will be applied to the local project.',
-            migration,
-            conflicts=conflicts,
-            border_style='green',
-        )
-        
-        if require_confirm:
-            if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
-                raise UserAbort('Pull cancelled by user')
-        
-        await self._run_commands(self.commands.before_pull, migration, conn)
-            
-        if conflicts is not None and not conflicts.empty():
-            await self._resolve_conflicts(conflicts)
-            console.print('Pull continues after preserving conflicted local files', style='green')
-        
-        for directory in migration.dirs.created:
-            pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
-            console.print('  remote > create directory', style='green')
-        for directory in migration.dirs.deleted:
-            try:
-                shutil.rmtree(directory)
-            except FileNotFoundError:
-                pass
-            console.print('  remote > delete directory', directory, style='red')
-                
-        for file in migration.files.deleted:
-            if os.path.exists(file):
-                os.remove(file)
-            console.print('  remote > delete', file, style='red')
-        
-        await self._download_files(conn, migration.files.created, '  remote > create', style='green')
-        await self._download_files(conn, migration.files.changed, '  remote > update', style='violet')
-        
-        tasks = [self._save_version(version, ignore_error=ignore_version_exists) for version in remote_versions]
-        await asyncio.gather(*tasks)
-        await self._save_prevstate(remote_versions[-1].filemap)
-        
-        await self._run_commands(self.commands.after_pull, migration, conn)
+        title = 'Pull'
+        subtitle = 'These changes will be applied to the local project.'
+        border_style = 'green'
+        plan_state = self._build_sync_plan_state(migration, conflicts)
+
+        with Live(
+            self._render_sync_plan(title, subtitle, migration, conflicts=conflicts, border_style=border_style, plan_state=plan_state),
+            console=console,
+            refresh_per_second=8,
+        ) as live:
+            if require_confirm:
+                if not self._confirm('Apply pull changes?', 'Pull cancelled by user'):
+                    raise UserAbort('Pull cancelled by user')
+
+            await self._run_commands(self.commands.before_pull, migration, conn)
+
+            if conflicts is not None and not conflicts.empty():
+                await self._resolve_conflicts(conflicts)
+                self._mark_sync_plan_paths(
+                    live,
+                    title,
+                    subtitle,
+                    migration,
+                    plan_state,
+                    conflicts.files + conflicts.dirs,
+                    'preserved',
+                    conflicts=conflicts,
+                    border_style=border_style,
+                )
+
+            for directory in migration.dirs.created:
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'create dir', directory, 'syncing', conflicts=conflicts, border_style=border_style)
+                pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'create dir', directory, 'done', conflicts=conflicts, border_style=border_style)
+
+            for directory in migration.dirs.deleted:
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'delete dir', directory, 'syncing', conflicts=conflicts, border_style=border_style)
+                try:
+                    shutil.rmtree(directory)
+                    status = 'done'
+                except FileNotFoundError:
+                    status = 'skipped'
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'delete dir', directory, status, conflicts=conflicts, border_style=border_style)
+
+            for file in migration.files.deleted:
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'delete', file, 'syncing', conflicts=conflicts, border_style=border_style)
+                if os.path.exists(file):
+                    os.remove(file)
+                    status = 'done'
+                else:
+                    status = 'skipped'
+                self._update_sync_plan_status(live, title, subtitle, migration, plan_state, 'delete', file, status, conflicts=conflicts, border_style=border_style)
+
+            update_pull_status = lambda action, path, status: self._update_sync_plan_status(live, title, subtitle, migration, plan_state, action, path, status, conflicts=conflicts, border_style=border_style)
+            await self._download_files(conn, migration.files.created, progress_callback=update_pull_status, progress_action='create')
+            await self._download_files(conn, migration.files.changed, progress_callback=update_pull_status, progress_action='update')
+
+            tasks = [self._save_version(version, ignore_error=ignore_version_exists) for version in remote_versions]
+            await asyncio.gather(*tasks)
+            await self._save_prevstate(remote_versions[-1].filemap)
+
+            await self._run_commands(self.commands.after_pull, migration, conn)
         
     async def _push(self, local_version: DirVersion, migration: Migration, conn: SSHClientConnection):
-        self._render_sync_plan(
-            'Push',
-            'These changes will be applied to the remote project.',
-            migration,
-            border_style='cyan',
-        )
-        
-        if not self._confirm('Apply push changes?', 'Push cancelled by user'):
-            raise UserAbort('Push cancelled by user')
+        title = 'Push'
+        subtitle = 'These changes will be applied to the remote project.'
+        border_style = 'cyan'
+        plan_state = self._build_sync_plan_state(migration)
 
-        local_version.message = self._prompt_version_message()
-        
-        await self._remote_create_downgrade(conn, migration, local_version)
-        
-        await self._run_commands(self.commands.before_push, migration, conn)
-        
-        await asyncio.gather(*[self._remote_mk_dir(conn, dir, '  remote < make directory') for dir in migration.dirs.created])
-        await self._delete_directories(conn, migration.dirs.deleted, '  remote < delete directory')
-            
-        await self._upload_files(conn, migration.files.changed, '  remote < update', style='violet')
-        await self._upload_files(conn, migration.files.created, '  remote < create', style='green')
-        await self._delete_files(conn, migration.files.deleted, '  remote < delete')
-        
-        await self._set_remote_version(local_version, conn)
-        await self._save_version(local_version)
-        await self._save_prevstate(local_version.filemap)
-        
-        await self._run_commands(self.commands.after_push, migration, conn)
+        with Live(
+            self._render_sync_plan(title, subtitle, migration, border_style=border_style, plan_state=plan_state),
+            console=console,
+            refresh_per_second=8,
+        ) as live:
+            if not self._confirm('Apply push changes?', 'Push cancelled by user'):
+                raise UserAbort('Push cancelled by user')
+
+            local_version.message = self._prompt_version_message()
+
+            await self._remote_create_downgrade(conn, migration, local_version)
+
+            try:
+                await self._run_commands(self.commands.before_push, migration, conn)
+
+                update_push_status = lambda action, path, status: self._update_sync_plan_status(live, title, subtitle, migration, plan_state, action, path, status, border_style=border_style)
+                await asyncio.gather(*[
+                    self._remote_mk_dir(conn, dir, progress_callback=update_push_status, progress_action='create dir')
+                    for dir in migration.dirs.created
+                ])
+                await self._delete_directories(conn, migration.dirs.deleted, progress_callback=update_push_status, progress_action='delete dir')
+
+                await self._upload_files(conn, migration.files.changed, progress_callback=update_push_status, progress_action='update')
+                await self._upload_files(conn, migration.files.created, progress_callback=update_push_status, progress_action='create')
+                await self._delete_files(conn, migration.files.deleted, progress_callback=update_push_status, progress_action='delete')
+
+                await self._set_remote_version(local_version, conn)
+                await self._save_version(local_version)
+                await self._save_prevstate(local_version.filemap)
+
+                await self._run_commands(self.commands.after_push, migration, conn)
+            except Exception as exc:
+                for path_state in plan_state:
+                    if path_state['status'] == 'syncing':
+                        path_state['status'] = 'failed'
+                live.update(
+                    self._render_sync_plan(
+                        title,
+                        subtitle,
+                        migration,
+                        border_style=border_style,
+                        plan_state=plan_state,
+                    )
+                )
+                try:
+                    await self._rollback_remote_push(conn, local_version)
+                except RemoteRollbackError as rollback_exc:
+                    raise RemoteRollbackError(
+                        f'Push failed and remote rollback also failed. Original error: {exc}. Rollback error: {rollback_exc}'
+                    ) from exc
+                raise RemoteSyncError(
+                    f'Push failed, remote changes were rolled back: {exc}'
+                ) from exc
         
     @staticmethod
     def _parse_cmd_config(cmd_config: dict) -> CmdConfig:
@@ -2047,14 +2291,12 @@ class SSHMirror:
     async def _set_remote_version(self, v: DirVersion, conn: SSHClientConnection) -> str:
         tmp_path = '.sshmirror/remote.version.tmp'
         remote_path = f'{self.versions_directory}/{v.filename()}'
-        async with aiofiles.open(tmp_path, 'w') as f:
+        async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
             await f.write(v.dumps())
         
         try:
             async with conn.start_sftp_client() as sftp:
                 await self._upload_file(sftp, tmp_path, remote_path=self.remotedir + remote_path)
-        except Exception as e:
-            print(e)
         finally:
             os.remove(tmp_path)
         
@@ -2190,67 +2432,83 @@ class SSHMirror:
     
         return filemap
     
-    async def _download_files(self, conn: SSHClientConnection, paths, event_type: str | None = None, style: str | None = None):
+    async def _download_files(self, conn: SSHClientConnection, paths, event_type: str | None = None, style: str | None = None, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         async with conn.start_sftp_client() as sftp:
-            tasks = [self._download_file(sftp, path, event_type, style) for path in paths]
+            tasks = [self._download_file(sftp, path, event_type, style, progress_callback=progress_callback, progress_action=progress_action) for path in paths]
             while len(tasks) > 0:
                 await asyncio.gather(*tasks[:10])
                 tasks = tasks[10:]
             
-    async def _download_file(self, sftp: SFTPClient, path, event_type: str | None = None, style: str | None = None):
+    async def _download_file(self, sftp: SFTPClient, path, event_type: str | None = None, style: str | None = None, *, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         remote_path = os.path.join(self.remotedir, path).replace('\\', '/')
+        if progress_callback is not None and progress_action is not None:
+            progress_callback(progress_action, path, 'syncing')
         try:
             await sftp.get(remote_path, path)
-            if event_type:
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'done')
+            elif event_type:
                 console.print(event_type, path, style=style)
         except Exception as e:
-            print('ERROR remote > download', path)
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'failed')
+            raise RemoteSyncError(f'Failed to download {path}: {e}') from e
     
-    async def _upload_files(self, conn: SSHClientConnection, paths, event_type: str | None = None, style: str | None = None):
+    async def _upload_files(self, conn: SSHClientConnection, paths, event_type: str | None = None, style: str | None = None, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         sem = asyncio.Semaphore(10)
         async def sem_coro(sftp, path, event_type, style):
             async with sem:
-                return await self._upload_file(sftp, path, event_type, style)
+                return await self._upload_file(sftp, path, event_type, style, progress_callback=progress_callback, progress_action=progress_action)
         async with conn.start_sftp_client() as sftp:
             await asyncio.gather(*[sem_coro(sftp, path, event_type, style) for path in paths])
     
-    async def _upload_file(self, sftp: SFTPClient, path, event_type: str | None = None, style: str | None = None, remote_path: str | None = None):
+    async def _upload_file(self, sftp: SFTPClient, path, event_type: str | None = None, style: str | None = None, remote_path: str | None = None, *, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         remote_path = os.path.join(self.remotedir, remote_path or path).replace('\\', '/')
+        if progress_callback is not None and progress_action is not None:
+            progress_callback(progress_action, path, 'syncing')
         try:  
             await sftp.put(path, remote_path, preserve=True)
-            if event_type:
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'done')
+            elif event_type:
                 console.print(event_type, path, style=style)
         except Exception as e:
-            print('ERROR remote < upload', e)
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'failed')
+            raise RemoteSyncError(f'Failed to upload {path} to {remote_path}: {e}') from e
             
     async def _remote_create_downgrade(self, conn: SSHClientConnection, migration: Migration, version: DirVersion):
         directory = f'{self.migrations_directory}/{version.name()}'
         abs_directory = self._remote_get_abs_path(directory)
-        await conn.run(f'mkdir -p {abs_directory}/downgrade')
+        await self._run_remote_checked(
+            conn,
+            f'mkdir -p {shlex.quote(abs_directory)}/downgrade',
+            f'Failed to create remote rollback directory for version {version.uid}',
+        )
         
         cmds: list[str] = []
         cp_paths: list[CopyPath] = []
         
         for file in migration.files.created:
-            cmds.append(f'rm "{self._remote_get_abs_path(file)}"')
+            cmds.append(f'rm {shlex.quote(file)}')
         
         for d in migration.dirs.deleted:
-            cmds.append(f'mkdir -p "{self._remote_get_abs_path(d)}"')
+            cmds.append(f'mkdir -p {shlex.quote(d)}')
         for d in migration.dirs.created:
-            cmds.append(f'rm -r "{self._remote_get_abs_path(d)}"')
+            cmds.append(f'rm -r {shlex.quote(d)}')
         
         for file in migration.files.changed + migration.files.deleted:
             dest = f'{directory}/downgrade/{file}'
             cp_paths.append(CopyPath(origin=file, destination=dest))
-            cmds.append(f'cp "{self._remote_get_abs_path(dest)}" "{self._remote_get_abs_path(file)}"')
+            cmds.append(f'cp {shlex.quote(dest)} {shlex.quote(file)}')
             
-        cmds.append(f'rm "{self._remote_get_abs_path(self.versions_directory)}/{version.filename()}"')
-        cmds.append(f'rm -r "{abs_directory}"')
+        cmds.append(f'rm {shlex.quote(f"{self.versions_directory}/{version.filename()}")}')
+        cmds.append(f'rm -r {shlex.quote(directory)}')
             
         await self._remote_cp_files(conn, cp_paths)
-        await conn.run(f"echo '{'\n'.join(cmds)}' > {abs_directory}/_downgrade.sh")
-        await conn.run(f"echo '{version.dumps()}' > {abs_directory}/_version.json")
-        await conn.run(f"echo '{migration.changes().model_dump_json(indent=4)}' > {abs_directory}/_migration.json")
+        await self._write_remote_text_file(conn, f'{directory}/_downgrade.sh', '\n'.join(cmds))
+        await self._write_remote_text_file(conn, f'{directory}/_version.json', version.dumps())
+        await self._write_remote_text_file(conn, f'{directory}/_migration.json', migration.changes().model_dump_json(indent=4))
             
     def _remote_get_abs_path(self, path: str):
         assert not path.startswith(self.remotedir)
@@ -2266,55 +2524,92 @@ class SSHMirror:
     async def _remote_cp_file(self, conn: SSHClientConnection, path: CopyPath):
         origin = os.path.join(self.remotedir, path.origin).replace('\\', '/')
         destination = os.path.join(self.remotedir, path.destination).replace('\\', '/')
-        cmd = f'mkdir -p "{os.path.dirname(destination)}" && cp "{origin}" "{destination}"'
-        await conn.run(cmd)
+        cmd = f'mkdir -p {shlex.quote(os.path.dirname(destination))} && cp {shlex.quote(origin)} {shlex.quote(destination)}'
+        await self._run_remote_checked(
+            conn,
+            cmd,
+            f'Failed to create remote rollback copy for {path.origin}',
+        )
         # print("!@$!", f'cp "{origin}" "{destination}"', result.stderr.strip())
     
-    async def _delete_files(self, conn: SSHClientConnection, paths: list[str], event_type: str | None = None):
+    async def _delete_files(self, conn: SSHClientConnection, paths: list[str], event_type: str | None = None, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         sem = asyncio.Semaphore(10)
         async def sem_coro(conn, path, event_type):
             async with sem:
-                return await self._delete_file(conn, path, event_type)
+                return await self._delete_file(conn, path, event_type, progress_callback=progress_callback, progress_action=progress_action)
         await asyncio.gather(*[sem_coro(conn, path, event_type) for path in paths])
     
-    async def _delete_file(self, conn: SSHClientConnection, path: str, event_type: str | None = None):
+    async def _delete_file(self, conn: SSHClientConnection, path: str, event_type: str | None = None, *, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         remote_path = os.path.join(self.remotedir, path).replace('\\', '/')
-        check = await conn.run(f'test -f "{remote_path}" && echo "File exists" || echo "File not exists"')
+        if progress_callback is not None and progress_action is not None:
+            progress_callback(progress_action, path, 'syncing')
+        check = await conn.run(f'test -f {shlex.quote(remote_path)} && echo "File exists" || echo "File not exists"', check=False)
         if check.stdout.strip() == 'File not exists':
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'skipped')
             return
-        result = await conn.run(f'rm -f {remote_path}')
-        if result.exit_status == 0:
-            if event_type:
+        try:
+            await self._run_remote_checked(conn, f'rm -f {shlex.quote(remote_path)}', f'Failed to delete remote file {path}')
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'done')
+            elif event_type:
                 console.print(event_type, path, style='red')
-        else:
-            print('ERROR remote < delete', path)
-            print(result.stderr)
+        except Exception:
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, path, 'failed')
+            raise
             
-    async def _delete_directories(self, conn: SSHClientConnection, directories: list[str], event_type: str | None = None):
+    async def _delete_directories(self, conn: SSHClientConnection, directories: list[str], event_type: str | None = None, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         sem = asyncio.Semaphore(10)
         async def sem_coro(conn, directory, event_type):
             async with sem:
-                return await self._delete_directory(conn, directory, event_type)
+                return await self._delete_directory(conn, directory, event_type, progress_callback=progress_callback, progress_action=progress_action)
         await asyncio.gather(*[sem_coro(conn, directory, event_type) for directory in directories])
         
-    async def _delete_directory(self, conn: SSHClientConnection, directory: str, event_type: str | None = None):
+    async def _delete_directory(self, conn: SSHClientConnection, directory: str, event_type: str | None = None, *, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         remote_path = os.path.join(self.remotedir, directory).replace('\\', '/')
-        check = await conn.run(f'test -d "{remote_path}" && echo "Directory exists" || echo "Directory not exists"')
+        if progress_callback is not None and progress_action is not None:
+            progress_callback(progress_action, directory, 'syncing')
+        check = await conn.run(f'test -d {shlex.quote(remote_path)} && echo "Directory exists" || echo "Directory not exists"', check=False)
         if check.stdout.strip() == 'Directory not exists':
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, directory, 'skipped')
             return
-        result = await conn.run(f'rm -rf {remote_path}')
-        if result.exit_status == 0:
-            if event_type:
+        try:
+            await self._run_remote_checked(conn, f'rm -rf {shlex.quote(remote_path)}', f'Failed to delete remote directory {directory}')
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, directory, 'done')
+            elif event_type:
                 console.print(event_type, directory, style='red')
-        else:
-            print('ERROR remote < delete directory', directory)
-            print(result.stderr)
+        except Exception:
+            if progress_callback is not None and progress_action is not None:
+                progress_callback(progress_action, directory, 'failed')
+            raise
             
-    async def _remote_mk_dir(self, conn: SSHClientConnection, directory: str, event_type: str | None = None):
+    async def _remote_mk_dir(self, conn: SSHClientConnection, directory: str, event_type: str | None = None, progress_callback: Callable[[str, str, str], None] | None = None, progress_action: str | None = None):
         remote_path = os.path.join(self.remotedir, directory).replace('\\', '/')
-        await conn.run(f'mkdir -p {remote_path}')
-        if event_type and directory != '':
-            console.print(event_type, directory, style='green')
+        if progress_callback is not None and progress_action is not None and directory != '':
+            progress_callback(progress_action, directory, 'syncing')
+        try:
+            await self._run_remote_checked(conn, f'mkdir -p {shlex.quote(remote_path)}', f'Failed to create remote directory {directory}')
+            if progress_callback is not None and progress_action is not None and directory != '':
+                progress_callback(progress_action, directory, 'done')
+            elif event_type and directory != '':
+                console.print(event_type, directory, style='green')
+        except Exception:
+            if progress_callback is not None and progress_action is not None and directory != '':
+                progress_callback(progress_action, directory, 'failed')
+            raise
+
+    async def _write_remote_text_file(self, conn: SSHClientConnection, relative_path: str, content: str) -> None:
+        local_tmp_path = os.path.join('.sshmirror', f'.remote-write-{uuid.uuid4().hex}.tmp')
+        try:
+            await write_text_file_atomic_async(local_tmp_path, content, encoding='utf-8')
+            async with conn.start_sftp_client() as sftp:
+                await self._upload_file(sftp, local_tmp_path, remote_path=self._remote_get_abs_path(relative_path))
+        finally:
+            if os.path.exists(local_tmp_path):
+                os.remove(local_tmp_path)
             
 if __name__ == '__main__':
     try:

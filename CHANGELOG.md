@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.16
+
+### Changed
+
+- Replaced the interactive `View version changes` menu item with a `Versions` submenu containing `History` and `Compare`.
+- Added automatic previous-version diff browsing for `Versions -> History`.
+- Reworked `push` and `pull` execution so the existing preview table stays on screen and the `Status` column updates live during synchronization.
+- Made version descriptions mandatory during `push` instead of silently defaulting to `update`.
+
+### Fixed
+
+- Removed duplicate visible CLI actions for force-discarding local changes, leaving a single user-facing discard action.
+- Skipped the expensive full project re-compare after a normal `push` when no sync hook commands are configured.
+- Cleared the temporary `Connect to remote...` line before interactive version lists are shown.
+- Adjusted version pagination controls so `Older versions` appears before the version list and `Newer versions` appears after it.
+- Made remote `push` synchronization atomic by rolling back remote changes when any file sync step fails.
+- Switched generated downgrade scripts to relative paths so rollback metadata no longer embeds absolute remote project paths.
+
 ## 0.1.15
 
 ### Changed

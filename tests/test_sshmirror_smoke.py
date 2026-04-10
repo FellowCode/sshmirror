@@ -12,13 +12,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from sshmirror import SSHMirror, SSHMirrorCallbacks, SSHMirrorConfig, UserAbort, __version__
-from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, build_parser
+from sshmirror.cli import _build_interactive_menu_items, _build_styled_version_choice, _build_version_choice_map, _build_version_page_choices, _choose_version_interactively, _configure_interactive_args, _create_default_config, _format_version_choice_label, _format_version_page_prompt, _render_version_page, _show_current_changes_cli, _show_version_changes_cli, _show_version_history_cli, build_parser
 from sshmirror.core.filemap import DirVersion, Migration
 from sshmirror.core.filemap import FileMap
 from sshmirror.core.filewatcher import Filewatcher
 from sshmirror.core.schemas import DiffDetail, DiffFileChange, DiffVersionInfo
 from sshmirror.core.utils import check_path_is_ignored, compile_ignore_rules, parse_ignore_file
 from sshmirror.prompts import _questionary_available, prompt_choice, prompt_confirm
+from sshmirror.sshmirror import RemoteRollbackError, RemoteSyncError
 
 
 @contextmanager
@@ -132,6 +133,132 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                     asyncio.run(mirror.force_pull())
 
+    def test_push_rolls_back_remote_changes_when_file_sync_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                local_file = tmp_path / 'created.txt'
+                local_file.write_text('payload', encoding='utf-8')
+
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                origin = FileMap()
+                target = FileMap()
+                target.add('created.txt', 'md5-created', size=7, mtime=1)
+                migration = origin.migrate_to(target)
+                version = mirror._create_version(target)
+                conn = Mock(spec=SSHClientConnection)
+
+                with patch.object(mirror, '_confirm', return_value=True), \
+                     patch.object(mirror, '_prompt_version_message', return_value='atomic push'), \
+                     patch.object(mirror, '_remote_create_downgrade', AsyncMock()), \
+                     patch.object(mirror, '_run_commands', AsyncMock()), \
+                     patch.object(mirror, '_remote_mk_dir', AsyncMock()), \
+                     patch.object(mirror, '_delete_directories', AsyncMock()), \
+                     patch.object(mirror, '_upload_files', AsyncMock(side_effect=[None, RemoteSyncError('upload failed')])), \
+                     patch.object(mirror, '_delete_files', AsyncMock()), \
+                     patch.object(mirror, '_rollback_remote_push', AsyncMock()) as rollback_mock, \
+                     patch.object(mirror, '_set_remote_version', AsyncMock()), \
+                     patch.object(mirror, '_save_version', AsyncMock()) as save_version_mock, \
+                     patch.object(mirror, '_save_prevstate', AsyncMock()) as save_prevstate_mock:
+                    with self.assertRaisesRegex(RemoteSyncError, 'rolled back'):
+                        asyncio.run(mirror._push(version, migration, conn))
+
+                rollback_mock.assert_awaited_once_with(conn, version)
+                save_version_mock.assert_not_awaited()
+                save_prevstate_mock.assert_not_awaited()
+
+    def test_push_reports_when_remote_rollback_also_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                local_file = tmp_path / 'created.txt'
+                local_file.write_text('payload', encoding='utf-8')
+
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                origin = FileMap()
+                target = FileMap()
+                target.add('created.txt', 'md5-created', size=7, mtime=1)
+                migration = origin.migrate_to(target)
+                version = mirror._create_version(target)
+                conn = Mock(spec=SSHClientConnection)
+
+                with patch.object(mirror, '_confirm', return_value=True), \
+                     patch.object(mirror, '_prompt_version_message', return_value='atomic push'), \
+                     patch.object(mirror, '_remote_create_downgrade', AsyncMock()), \
+                     patch.object(mirror, '_run_commands', AsyncMock()), \
+                     patch.object(mirror, '_remote_mk_dir', AsyncMock()), \
+                     patch.object(mirror, '_delete_directories', AsyncMock()), \
+                     patch.object(mirror, '_upload_files', AsyncMock(side_effect=[None, RemoteSyncError('upload failed')])), \
+                     patch.object(mirror, '_delete_files', AsyncMock()), \
+                     patch.object(mirror, '_rollback_remote_push', AsyncMock(side_effect=RemoteRollbackError('rollback failed'))):
+                    with self.assertRaisesRegex(RemoteRollbackError, 'rollback also failed'):
+                        asyncio.run(mirror._push(version, migration, conn))
+
+    def test_remote_downgrade_script_uses_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                origin = FileMap()
+                origin.add('changed.txt', 'md5-old', size=3, mtime=1)
+                origin.add('deleted.txt', 'md5-del', size=3, mtime=1)
+                origin.add_directory('deleted-dir')
+
+                target = FileMap()
+                target.add('changed.txt', 'md5-new', size=4, mtime=2)
+                target.add('created.txt', 'md5-created', size=7, mtime=3)
+                target.add_directory('created-dir')
+
+                migration = origin.migrate_to(target)
+                version = mirror._create_version(target)
+                conn = Mock(spec=SSHClientConnection)
+
+                with patch.object(mirror, '_remote_cp_files', AsyncMock()) as cp_mock, \
+                     patch.object(mirror, '_write_remote_text_file', AsyncMock()) as write_remote_text_file_mock, \
+                     patch.object(mirror, '_run_remote_checked', AsyncMock()):
+                    asyncio.run(mirror._remote_create_downgrade(conn, migration, version))
+
+                cp_mock.assert_awaited_once()
+
+                downgrade_call = next(
+                    call for call in write_remote_text_file_mock.await_args_list
+                    if call.args[1].endswith('/_downgrade.sh')
+                )
+                downgrade_script = downgrade_call.args[2]
+
+                self.assertIn('rm created.txt', downgrade_script)
+                self.assertIn('mkdir -p deleted-dir', downgrade_script)
+                self.assertIn('rm -r created-dir', downgrade_script)
+                self.assertIn('cp .sshmirror/migrations/', downgrade_script)
+                self.assertNotIn('/app/', downgrade_script)
+
     def test_render_diff_detail_accepts_structured_detail(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -204,6 +331,10 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         self.assertEqual(selected.uid, '1')
         self.assertEqual(mirror.list_remote_versions_page.await_count, 2)
         self.assertIn('showing 6-25 of 25', prompt_mock.call_args_list[0].args[0])
+        self.assertEqual(prompt_mock.call_args_list[0].args[1][0], 'Older versions')
+        self.assertEqual(prompt_mock.call_args_list[0].args[1][-1], 'Back')
+        self.assertNotIn('Newer versions', prompt_mock.call_args_list[0].args[1])
+        self.assertEqual(prompt_mock.call_args_list[1].args[1][-2], 'Newer versions')
         self.assertEqual(prompt_mock.call_args_list[0].kwargs['default'], _format_version_choice_label(versions_page_1[-1]))
 
     def test_version_choice_label_uses_five_digit_global_number(self):
@@ -274,11 +405,51 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 'Back',
                 'Back',
             ],
-        ):
+        ), patch('sshmirror.cli.clear_n_console_rows') as clear_rows_mock:
             asyncio.run(_show_version_changes_cli(mirror))
 
+        clear_rows_mock.assert_called_once_with(1)
         mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-9.json', 'version-15.json')
         mirror.get_version_change_detail_by_range.assert_awaited_once_with('version-9.json', 'version-15.json', 9, 15, 'src/app.py')
+
+    def test_show_version_history_cli_compares_selected_version_with_previous(self):
+        versions_page = [
+            DiffVersionInfo(uid='1', label='2026-04-09 12:01:00 UTC | 00000001 | user | msg-1', dt='dt-1', index=1, filename='version-1.json'),
+            DiffVersionInfo(uid='2', label='2026-04-09 12:02:00 UTC | 00000002 | user | msg-2', dt='dt-2', index=2, filename='version-2.json'),
+        ]
+        previous_version = DiffVersionInfo(
+            uid='1',
+            label='2026-04-09 12:01:00 UTC | 00000001 | user | msg-1',
+            dt='dt-1',
+            index=1,
+            filename='version-1.json',
+        )
+        file_changes = [
+            DiffFileChange(action='change', path='src/app.py'),
+            DiffFileChange(action='create', path='src/new.py'),
+        ]
+        mirror = Mock()
+        mirror.list_remote_versions_page = AsyncMock(return_value=(versions_page, 3))
+        mirror.get_remote_version_info_by_index = AsyncMock(return_value=previous_version)
+        mirror.list_version_changes_by_filenames = AsyncMock(return_value=file_changes)
+        mirror.get_version_change_detail_by_range = AsyncMock(return_value=DiffDetail(
+            path='src/app.py',
+            action='change',
+            before_label='before',
+            after_label='after',
+            before_text='old',
+            after_text='new',
+        ))
+        mirror.render_diff_detail = Mock()
+
+        with patch('sshmirror.cli.prompt_choice', side_effect=[_format_version_choice_label(versions_page[1]), 'src/app.py', 'Back', 'Back']), \
+             patch('sshmirror.cli.clear_n_console_rows') as clear_rows_mock:
+            asyncio.run(_show_version_history_cli(mirror))
+
+        clear_rows_mock.assert_called_once_with(1)
+        mirror.get_remote_version_info_by_index.assert_awaited_once_with(1)
+        mirror.list_version_changes_by_filenames.assert_awaited_once_with('version-1.json', 'version-2.json')
+        mirror.get_version_change_detail_by_range.assert_awaited_once_with('version-1.json', 'version-2.json', 1, 2, 'src/app.py')
 
     def test_file_inspection_choice_shows_created_and_deleted_as_non_selectable(self):
         base_versions_page = [
@@ -741,8 +912,24 @@ class SSHMirrorSmokeTests(unittest.TestCase):
         labels = [label for label, _action in menu_items]
 
         self.assertIn('Pull & Push', labels)
+        self.assertIn('Versions', labels)
+        self.assertNotIn('View version changes', labels)
         self.assertIn('Test connection', labels)
+        self.assertIn('Discard all local changes', labels)
+        self.assertNotIn('Force pull', labels)
         self.assertIn('Exit', labels)
+
+    def test_interactive_versions_menu_can_open_history(self):
+        args = build_parser().parse_args([])
+
+        with patch('sshmirror.cli._find_default_cli_path', return_value='sshmirror.config.yml'), \
+             patch('sshmirror.cli._is_sshmirror_initialized', return_value=True), \
+             patch('sshmirror.cli._has_stashed_changes', return_value=False), \
+             patch('sshmirror.cli.prompt_choice', side_effect=['Versions', 'History']):
+            configured_args = _configure_interactive_args(args)
+
+        self.assertTrue(configured_args.version_history)
+        self.assertFalse(configured_args.version_diff)
 
     def test_interactive_menu_exit_is_graceful(self):
         args = build_parser().parse_args([])
@@ -796,7 +983,9 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn('--status', result.stdout)
+        self.assertIn('--discard', result.stdout)
         self.assertIn('--test-connection', result.stdout)
+        self.assertNotIn('--force-pull', result.stdout)
 
     def test_ignore_rules_match_nested_directories_and_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1078,12 +1267,77 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 remote_create_downgrade.assert_awaited_once()
                 self.assertEqual(remote_create_downgrade.await_args.args[2].message, 'feature sync')
 
+    def test_run_skips_full_project_compare_after_push_without_sync_commands(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                (tmp_path / 'existing.txt').write_text('before\n', encoding='utf-8')
+                (tmp_path / 'new.txt').write_text('after\n', encoding='utf-8')
+
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                prevstate = FileMap()
+                prevstate.add('existing.txt', 'old-md5')
+                state = FileMap()
+                state.add('existing.txt', 'old-md5')
+                state.add('new.txt', 'new-md5')
+
+                local_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='local-version',
+                    filemap=prevstate,
+                )
+                pushed_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 1, tzinfo=datetime.timezone.utc),
+                    uid='pushed-version',
+                    filemap=state,
+                )
+
+                class DummyConn:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                filemap_mock = AsyncMock(return_value=state)
+
+                with patch('sshmirror.sshmirror.asyncssh.connect', return_value=DummyConn()), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows'), \
+                     patch.object(mirror, '_validate_conflicts', new=AsyncMock(return_value=True)), \
+                     patch.object(mirror, '_sync_ignore_file_before_transfer', new=AsyncMock()), \
+                     patch.object(mirror, '_load_or_create_prevstate', new=AsyncMock(return_value=prevstate)), \
+                     patch.object(mirror.filewatcher, 'get_filemap', new=filemap_mock), \
+                     patch.object(mirror, '_remote_mk_dir', new=AsyncMock()), \
+                     patch.object(mirror, '_get_local_version', new=AsyncMock(return_value=local_version)), \
+                     patch.object(mirror, '_get_remote_versions_stack', new=AsyncMock(return_value=[local_version])), \
+                     patch.object(mirror, '_create_version', return_value=pushed_version), \
+                     patch.object(mirror, '_push', new=AsyncMock()) as push_mock, \
+                     patch.object(mirror, '_get_remote_map', new=AsyncMock(side_effect=AssertionError('full compare should be skipped'))), \
+                     patch.object(mirror, '_confirm', return_value=False):
+                    asyncio.run(mirror.run())
+
+                push_mock.assert_awaited_once()
+                self.assertEqual(filemap_mock.await_count, 1)
+
     def test_version_message_accepts_exactly_50_characters(self):
         message = 'x' * 50
 
         normalized = SSHMirror._normalize_version_message(message)
 
         self.assertEqual(normalized, message)
+
+    def test_version_message_rejects_empty_value(self):
+        with self.assertRaisesRegex(ValueError, 'Version description is required'):
+            SSHMirror._normalize_version_message('   ')
 
     def test_version_message_rejects_more_than_50_characters(self):
         with self.assertRaisesRegex(ValueError, 'at most 50 characters'):
@@ -1109,7 +1363,24 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 message = mirror._prompt_version_message()
 
             self.assertEqual(message, 'short message')
-            prompt_mock.assert_called_once_with('Version description (max 50 chars)', 'update')
+            prompt_mock.assert_called_once_with('Version description (max 50 chars)', None)
+
+    def test_prompt_version_message_requires_text_callback(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    ),
+                )
+
+                with self.assertRaisesRegex(UserAbort, 'Version description is required'):
+                    mirror._prompt_version_message()
 
 
 if __name__ == '__main__':

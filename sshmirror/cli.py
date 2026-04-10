@@ -14,7 +14,7 @@ try:
     from .prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from .sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from .core.exceptions import UserAbort
-    from .core.utils import read_text_file
+    from .core.utils import clear_n_console_rows, read_text_file
 except ImportError:
     from config import SSHMirrorCallbacks, SSHMirrorConfig
     from core.schemas import DiffFileChange, DiffVersionInfo
@@ -23,7 +23,7 @@ except ImportError:
     from prompts import prompt_choice, prompt_confirm, prompt_discard_files, prompt_secret, prompt_text
     from sshmirror import SSHMirror, STASH_METADATA_FILE, console
     from core.exceptions import UserAbort
-    from core.utils import read_text_file
+    from core.utils import clear_n_console_rows, read_text_file
 
 
 VERSION_PAGE_SIZE = 20
@@ -153,10 +153,9 @@ def _build_interactive_menu_items(
             _menu_item('Pull & Push', 'Pull & Push'),
             _menu_item('Status', 'Status'),
             _menu_item('View current changes', 'View current changes'),
-            _menu_item('View version changes', 'View version changes'),
+            _menu_item('Versions', 'Versions'),
             _menu_item('Pull only', 'Pull only'),
             _menu_item('Restore stashed changes', 'Restore stashed changes') if has_stash else _menu_item('Stash changes', 'Stash changes'),
-            _menu_item('Force pull', 'Force pull'),
             _menu_item('Discard all local changes', 'Discard all local changes'),
             _menu_item('Discard selected files', 'Discard selected files'),
             _menu_item('Downgrade remote version', 'Downgrade remote version'),
@@ -184,6 +183,7 @@ def _build_interactive_menu_items(
 
 def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
     args.exit_requested = False
+    args.version_history = False
     while True:
         has_config = _find_default_cli_path('sshmirror.config.yml') is not None
         has_ignore = _find_default_cli_path('sshmirror.ignore.txt') is not None
@@ -227,14 +227,18 @@ def _configure_interactive_args(args: argparse.Namespace) -> argparse.Namespace:
             args.status = True
         elif action == 'View current changes':
             args.current_diff = True
-        elif action == 'View version changes':
-            args.version_diff = True
+        elif action == 'Versions':
+            version_action = prompt_choice('Versions:', ['History', 'Compare', 'Back'], default='History')
+            if version_action == 'Back':
+                continue
+            if version_action == 'History':
+                args.version_history = True
+            else:
+                args.version_diff = True
         elif action == 'Stash changes':
             args.stash_changes = True
         elif action == 'Restore stashed changes':
             args.restore_stash = True
-        elif action == 'Force pull':
-            args.force_pull = True
         elif action == 'Discard all local changes':
             args.discard = True
         elif action == 'Discard selected files':
@@ -254,8 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--version-diff', action='store_true', help='Interactively inspect file changes between local versions')
     parser.add_argument('--stash-changes', action='store_true', help='Stash local changes and sync from remote')
     parser.add_argument('--restore-stash', action='store_true', help='Restore previously stashed local changes')
-    parser.add_argument('--force-pull', action='store_true', help='Force pull from remote. Overwrite local files')
     parser.add_argument('--discard', action='store_true', help='Discard all local changes')
+    parser.add_argument('--force-pull', dest='discard', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--downgrade', action='store_true', help='Downgrade remote version')
     parser.add_argument('--discard-files', nargs='+', help='Files to discard (will be load from remote)')
     parser.add_argument('--test-connection', action='store_true', help='Test SSH access to the remote host and configured Docker host')
@@ -505,18 +509,19 @@ async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_in
         if base_version is not None and use_styled:
             base_styled_choice = _build_styled_version_choice(base_version, is_base=True)
 
-        nav_choices: list[str] = []
-        if has_newer:
-            nav_choices.append('Newer versions')
+        nav_choices_before: list[str] = []
+        nav_choices_after: list[str] = []
         if has_older:
-            nav_choices.append('Older versions')
-        nav_choices.append('Back')
+            nav_choices_before.append('Older versions')
+        if has_newer:
+            nav_choices_after.append('Newer versions')
+        terminal_nav_choices = ['Back']
 
         if use_styled:
             try:
                 import questionary as _q
                 base_prefix = [base_styled_choice] if base_styled_choice is not None else []
-                all_styled = base_prefix + list(styled_choices) + [_q.Choice(title=nav, value=nav) for nav in nav_choices]
+                all_styled = [_q.Choice(title=nav, value=nav) for nav in nav_choices_before] + base_prefix + list(styled_choices) + [_q.Choice(title=nav, value=nav) for nav in nav_choices_after + terminal_nav_choices]
             except Exception:
                 use_styled = False
 
@@ -530,13 +535,13 @@ async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_in
 
         if use_styled:
             choice = prompt_choice(
-                page_prompt, choices + nav_choices,
+                page_prompt, nav_choices_before + choices + nav_choices_after + terminal_nav_choices,
                 default=default_choice,
                 styled_choices=all_styled,
                 style=_VERSION_SELECT_STYLE,
             )
         else:
-            choice = prompt_choice(display_prompt, choices + nav_choices, default=default_choice)
+            choice = prompt_choice(display_prompt, nav_choices_before + choices + nav_choices_after + terminal_nav_choices, default=default_choice)
 
         if choice == 'Back':
             return None
@@ -557,6 +562,7 @@ async def _choose_version_interactively(mirror: SSHMirror, prompt: str, start_in
 async def _show_version_changes_cli(mirror: SSHMirror) -> None:
     console.print('Connect to remote...', style='yellow')
     _first_page_versions, total_versions = await mirror.list_remote_versions_page(page=0, page_size=VERSION_PAGE_SIZE)
+    clear_n_console_rows(1)
     if total_versions < 2:
         console.print('Need at least two remote versions to inspect changes', style='yellow')
         return
@@ -579,7 +585,24 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
     if target_version is None:
         return
 
+    await _inspect_version_range_cli(mirror, base_version, target_version)
+
+
+async def _inspect_version_range_cli(
+    mirror: SSHMirror,
+    base_version: DiffVersionInfo,
+    target_version: DiffVersionInfo,
+) -> None:
+    if base_version.index is None:
+        raise ValueError('Selected base version is missing index information')
+
+    if target_version.index is None:
+        raise ValueError('Selected target version is missing index information')
+
     if target_version.filename is None:
+        raise ValueError('Selected version is missing filename information')
+
+    if base_version.filename is None:
         raise ValueError('Selected version is missing filename information')
 
     file_actions = await mirror.list_version_changes_by_filenames(base_version.filename, target_version.filename)
@@ -630,6 +653,33 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         console.clear()
 
 
+async def _show_version_history_cli(mirror: SSHMirror) -> None:
+    console.print('Connect to remote...', style='yellow')
+    _first_page_versions, total_versions = await mirror.list_remote_versions_page(page=0, page_size=VERSION_PAGE_SIZE)
+    clear_n_console_rows(1)
+    if total_versions < 2:
+        console.print('Need at least two remote versions to inspect history', style='yellow')
+        return
+
+    target_version = await _choose_version_interactively(mirror, 'Choose version to inspect')
+    if target_version is None:
+        return
+
+    if target_version.index is None:
+        raise ValueError('Selected version is missing index information')
+
+    if target_version.index <= 0:
+        console.print('No previous version available for comparison', style='yellow')
+        return
+
+    base_version = await mirror.get_remote_version_info_by_index(target_version.index - 1)
+    if base_version is None:
+        console.print('Previous version is unavailable for comparison', style='yellow')
+        return
+
+    await _inspect_version_range_cli(mirror, base_version, target_version)
+
+
 def main(argv: list[str] | None = None) -> int:
     def signal_term_handler(*_args):
         console.print('\nCancel by user', style='red', end='')
@@ -660,13 +710,15 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(mirror.status())
         elif args.current_diff:
             asyncio.run(_show_current_changes_cli(mirror))
+        elif getattr(args, 'version_history', False):
+            asyncio.run(_show_version_history_cli(mirror))
         elif args.version_diff:
             asyncio.run(_show_version_changes_cli(mirror))
         elif args.restore_stash:
             asyncio.run(mirror.restore_stash())
         elif args.stash_changes:
             asyncio.run(mirror.stash_changes())
-        elif args.force_pull or args.discard:
+        elif args.discard:
             asyncio.run(mirror.force_pull())
         else:
             asyncio.run(mirror.run())

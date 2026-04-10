@@ -21,11 +21,10 @@ Depending on project state, the menu can include:
 - `Pull & Push`
 - `Status`
 - `View current changes`
-- `View version changes`
+- `Versions` (`History`, `Compare`)
 - `Pull only`
 - `Stash changes`
 - `Restore stashed changes`
-- `Force pull`
 - `Discard all local changes`
 - `Discard selected files`
 - `Downgrade remote version`
@@ -127,7 +126,6 @@ Main non-interactive flags:
 - `--pull` only pull from remote;
 - `--stash-changes` stash local changes before syncing;
 - `--restore-stash` restore previously stashed changes;
-- `--force-pull` overwrite local files from remote;
 - `--discard` discard all local changes;
 - `--discard-files <paths...>` discard only selected files;
 - `--downgrade` downgrade remote version;
