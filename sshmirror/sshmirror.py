@@ -11,6 +11,7 @@ import hashlib
 import yaml
 import typing
 import datetime
+import subprocess
 import uuid
 import aiofiles
 import pathlib
@@ -1323,6 +1324,8 @@ class SSHMirror:
     def _get_restart_container_connect_kwargs(self) -> dict[str, typing.Any]:
         if self.restart_container is None:
             raise ValueError('restart_container is not configured')
+        if self._restart_container_is_local():
+            raise ValueError('restart_container.local does not use SSH connection settings')
 
         restart_container = self.restart_container
         return self._build_connect_kwargs(
@@ -1332,8 +1335,13 @@ class SSHMirror:
             auth_kwargs=self._get_restart_container_auth_kwargs(),
         )
 
+    def _restart_container_is_local(self) -> bool:
+        return self.restart_container is not None and bool(self.restart_container.get('local', False))
+
     def _restart_container_uses_main_connection(self) -> bool:
         if self.restart_container is None:
+            return False
+        if self._restart_container_is_local():
             return False
 
         restart_connect_kwargs = self._get_restart_container_connect_kwargs()
@@ -1388,6 +1396,21 @@ class SSHMirror:
     @staticmethod
     def _command_error_text(result) -> str:
         return result.stderr.strip() or result.stdout.strip() or 'command failed'
+
+    async def _run_local_command(self, command: str):
+        return await asyncio.to_thread(
+            subprocess.run,
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+
+    async def _run_local_checked(self, command: str, error_message: str) -> str:
+        result = await self._run_local_command(command)
+        if result.returncode != 0:
+            raise RuntimeError(f'{error_message}: {self._command_error_text(result)}')
+        return result.stdout
 
     async def _run_remote_checked(self, conn: SSHClientConnection, command: str, error_message: str) -> str:
         result = await conn.run(command, check=False)
@@ -1447,8 +1470,53 @@ class SSHMirror:
             )
         raise RuntimeError(f'restart_container sudo check failed: {error_text}')
 
+    async def _run_restart_container_diagnostics_local(self) -> None:
+        try:
+            await self._run_local_checked(
+                'docker version',
+                'restart_container diagnostic failed: docker is not installed or is not available in PATH on the local host',
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if not self.restart_container or not self.restart_container.get('sudo', False):
+            return
+
+        sudo_check = await self._run_local_command(self._wrap_restart_container_command_for_sudo('true'))
+        if sudo_check.returncode == 0:
+            return
+
+        error_text = self._command_error_text(sudo_check)
+        lowered_error = error_text.lower()
+        if 'sorry, try again' in lowered_error or 'no password was provided' in lowered_error:
+            raise RuntimeError(
+                'restart_container sudo check failed: sudo password was rejected or not accepted by sudo on the local host'
+            )
+        if 'a password is required' in lowered_error:
+            raise RuntimeError(
+                'restart_container sudo check failed: sudo requires a password on the local host. Set restart_container.sudo_password or use the interactive password prompt.'
+            )
+        if 'tty' in lowered_error:
+            raise RuntimeError(
+                f'restart_container sudo check failed: {error_text}. The local host may require a tty for sudo.'
+            )
+        raise RuntimeError(f'restart_container sudo check failed: {error_text}')
+
     async def _test_restart_container(self):
         if self.restart_container is None:
+            return
+
+        if self._restart_container_is_local():
+            console.print('Run local Docker diagnostics...', style='yellow')
+            await self._run_restart_container_diagnostics_local()
+            clear_n_console_rows(1)
+            console.print('Check local docker container...', style='yellow')
+            await self._run_local_checked(
+                self._build_restart_container_docker_cmd('inspect --type container'),
+                f'restart_container check failed for {self.restart_container["container_name"]}',
+            )
+            clear_n_console_rows(1)
+            console.print('Local Docker connection ok', style='green')
             return
 
         console.print('Connect to Docker host...', style='yellow')
@@ -1470,6 +1538,32 @@ class SSHMirror:
                 )
             console.print('Docker host connection ok', style='green')
 
+    async def _maybe_restart_container(self):
+        if self.restart_container is None:
+            return
+
+        if self._confirm('Restart docker container?', 'Restart container choice is required'):
+            clear_n_console_rows(1)
+            if self._restart_container_is_local():
+                console.print('Restarting local container...', style='yellow')
+                await self._run_local_checked(
+                    self._build_restart_container_docker_cmd('restart'),
+                    f'restart_container restart failed for {self.restart_container["container_name"]}',
+                )
+                clear_n_console_rows(1)
+                console.print('Container restarted', style='green')
+                return
+
+            console.print('Connecting...', style='yellow')
+            async with asyncssh.connect(**self._get_restart_container_connect_kwargs()) as conn:
+                clear_n_console_rows(1)
+                console.print('Restarting...', style='yellow')
+                await conn.run(self._build_restart_container_docker_cmd('restart'))
+                clear_n_console_rows(1)
+                console.print('Container restarted', style='green')
+        else:
+            clear_n_console_rows(1)
+
     async def test_connection(self):
         console.print('Connect to remote host...', style='yellow')
         async with asyncssh.connect(**self._build_connect_kwargs(
@@ -1485,7 +1579,9 @@ class SSHMirror:
                 raise RuntimeError(f'remote host check failed: {stderr}')
             console.print('Remote host connection ok', style='green')
 
-        if self.restart_container is not None and not self._restart_container_uses_main_connection():
+        if self.restart_container is not None and (
+            self._restart_container_is_local() or not self._restart_container_uses_main_connection()
+        ):
             await self._test_restart_container()
         
     async def _load_or_create_prevstate(self) -> FileMap:
@@ -1839,6 +1935,7 @@ class SSHMirror:
                     migration = remote_map.migrate_to(state)
                     version = self._create_version(state)
                     await self._push(version, migration, conn)
+                await self._maybe_restart_container()
                 return
 
             pushed_version: DirVersion | None = None
@@ -1869,6 +1966,7 @@ class SSHMirror:
             if pushed_version is not None and not self._has_sync_commands():
                 console.print('Skip full remote/local verification after push: sync state is already known', style='dim')
                 console.print('Projects are equal', style='green')
+                await self._maybe_restart_container()
                 return
 
             console.print('Compare remote and local projects...', style='yellow')
@@ -1897,19 +1995,7 @@ class SSHMirror:
                 
             console.print('Projects are equal', style='green')
             
-        # Restart container
-        if self.restart_container is not None:
-            if self._confirm('Restart docker container?', 'Restart container choice is required'):
-                clear_n_console_rows(1)
-                console.print('Connecting...', style='yellow')
-                async with asyncssh.connect(**self._get_restart_container_connect_kwargs()) as conn:
-                    clear_n_console_rows(1)
-                    console.print('Restarting...', style='yellow')
-                    await conn.run(self._build_restart_container_docker_cmd('restart'))
-                    clear_n_console_rows(1)
-                    console.print('Container restarted', style='green')
-            else:
-                clear_n_console_rows(1)
+        await self._maybe_restart_container()
                     
             
     async def force_pull(self, require_confirm: bool = True):

@@ -102,6 +102,10 @@ remotedir: '/app'
 author: your-name
 
 restart_container:
+   # Optional. Restart a local container on the same machine where sshmirror runs.
+   # Do not combine with host/port/username or SSH auth fields.
+   # local: true
+
    # Optional. If omitted, host/port/username are reused from the main SSH config.
    # host: '192.168.12.22'
    # port: '23322'
@@ -110,7 +114,12 @@ restart_container:
   container_name: testcontainer
 ```
 
-`restart_container` connects to the Docker host where the container is running. If `host`, `port`, or `username` are not specified there, SSHMirror uses the main connection values.
+`restart_container` supports two modes:
+
+- remote Docker host restart via SSH;
+- local restart on the same machine where `sshmirror` is running by setting `restart_container.local: true`.
+
+If `host`, `port`, or `username` are not specified for remote mode, SSHMirror uses the main connection values.
 
 ## CLI Commands 🧰
 

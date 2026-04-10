@@ -64,7 +64,12 @@ author: user
 # Optional. If set, SSHMirror can restart a container after sync.
 # This is useful when the remote directory is mounted into a container and you want changes applied immediately.
 restart_container:
+    # Optional. Restart a container on the same machine where sshmirror is running,
+    # without connecting to a Docker host over SSH.
+    # local: true
+
     # Optional. If omitted, values from the main connection are reused.
+    # Do not set host/port/username together with local: true.
     # host: '127.0.0.1'
     # port: '22'
     # username: root
@@ -75,10 +80,10 @@ restart_container:
     # private_key_passphrase: 'KeyPassphrase'
     # password: 'password'
 
-    # Optional. Run docker commands with sudo on the Docker host.
+    # Optional. Run docker commands with sudo on the Docker host or local machine.
     sudo: true
 
-    # Optional. Needed only when sudo requires a password and SSH auth uses a key.
+    # Optional. Needed only when sudo requires a password.
     # sudo_password: 'password'
 
     # Docker container name that should be restarted after sync.

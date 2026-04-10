@@ -676,6 +676,48 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertEqual(restart_connect_kwargs['port'], 2222)
                 self.assertEqual(restart_connect_kwargs['username'], 'deploy')
 
+    def test_restart_container_local_mode_rejects_ssh_connection_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                with self.assertRaisesRegex(ValueError, 'restart_container.local'):
+                    SSHMirror(
+                        config=SSHMirrorConfig(
+                            host='127.0.0.1',
+                            port=22,
+                            username='root',
+                            localdir='.',
+                            remotedir='/app',
+                            restart_container={
+                                'local': True,
+                                'host': '192.168.1.10',
+                                'container_name': 'app',
+                            },
+                        )
+                    )
+
+    def test_restart_container_local_mode_does_not_use_ssh_connection_settings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'local': True,
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                self.assertTrue(mirror._restart_container_is_local())
+                with self.assertRaisesRegex(ValueError, 'does not use SSH connection settings'):
+                    mirror._get_restart_container_connect_kwargs()
+
     def test_test_connection_skips_duplicate_docker_host_check(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -714,6 +756,46 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 self.assertEqual(connect_mock.call_count, 1)
                 restart_test_mock.assert_not_awaited()
+
+    def test_test_connection_runs_local_restart_container_check_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'local': True,
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                class DummyConn:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                    async def run(self, _cmd, check=False):
+                        class Result:
+                            exit_status = 0
+                            stderr = ''
+                            stdout = ''
+                        return Result()
+
+                with patch('sshmirror.sshmirror.asyncssh.connect', return_value=DummyConn()) as connect_mock, \
+                     patch.object(mirror, '_test_restart_container', new=AsyncMock()) as restart_test_mock, \
+                     patch('sshmirror.sshmirror.clear_n_console_rows'):
+                    asyncio.run(mirror.test_connection())
+
+                self.assertEqual(connect_mock.call_count, 1)
+                restart_test_mock.assert_awaited_once()
 
     def test_restart_container_uses_configured_sudo_password(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -860,6 +942,35 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'docker is not installed or is not available in PATH'):
                     asyncio.run(mirror._run_restart_container_diagnostics(dummy_conn))
 
+    def test_maybe_restart_container_uses_local_docker_when_local_mode_is_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'local': True,
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                with patch.object(mirror, '_confirm', return_value=True), \
+                     patch.object(mirror, '_run_local_checked', new=AsyncMock()) as local_run_mock, \
+                     patch('sshmirror.sshmirror.clear_n_console_rows'), \
+                     patch('sshmirror.sshmirror.asyncssh.connect', side_effect=AssertionError('local restart must not use SSH')):
+                    asyncio.run(mirror._maybe_restart_container())
+
+                local_run_mock.assert_awaited_once_with(
+                    'docker restart app',
+                    'restart_container restart failed for app',
+                )
+
     def test_cli_help_mentions_docker_host_for_restart_connection(self):
         help_text = build_parser().format_help()
         normalized_help_text = re.sub(r'\x1b\[[0-9;]*m', '', help_text)
@@ -970,6 +1081,7 @@ class SSHMirrorSmokeTests(unittest.TestCase):
             self.assertIn('# Local project directory that will be synchronized.', content)
             self.assertIn('# Optional. If set, SSHMirror can restart a container after sync.', content)
             self.assertIn('restart_container:', content)
+            self.assertIn('# local: true', content)
             self.assertIn('# Docker container name that should be restarted after sync.', content)
 
     def test_cli_entrypoint_help(self):
@@ -1427,6 +1539,70 @@ class SSHMirrorSmokeTests(unittest.TestCase):
 
                 push_mock.assert_awaited_once()
                 self.assertEqual(filemap_mock.await_count, 1)
+
+    def test_run_prompts_restart_container_after_push_when_full_compare_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                (tmp_path / 'existing.txt').write_text('before\n', encoding='utf-8')
+                (tmp_path / 'new.txt').write_text('after\n', encoding='utf-8')
+
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                        restart_container={
+                            'container_name': 'app',
+                        },
+                    )
+                )
+
+                prevstate = FileMap()
+                prevstate.add('existing.txt', 'old-md5')
+                state = FileMap()
+                state.add('existing.txt', 'old-md5')
+                state.add('new.txt', 'new-md5')
+
+                local_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+                    uid='local-version',
+                    filemap=prevstate,
+                )
+                pushed_version = DirVersion(
+                    dt=datetime.datetime(2026, 4, 10, 10, 0, 1, tzinfo=datetime.timezone.utc),
+                    uid='pushed-version',
+                    filemap=state,
+                )
+
+                class DummyConn:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                filemap_mock = AsyncMock(return_value=state)
+
+                with patch('sshmirror.sshmirror.asyncssh.connect', return_value=DummyConn()), \
+                     patch('sshmirror.sshmirror.clear_n_console_rows'), \
+                     patch.object(mirror, '_validate_conflicts', new=AsyncMock(return_value=True)), \
+                     patch.object(mirror, '_sync_ignore_file_before_transfer', new=AsyncMock()), \
+                     patch.object(mirror, '_load_or_create_prevstate', new=AsyncMock(return_value=prevstate)), \
+                     patch.object(mirror.filewatcher, 'get_filemap', new=filemap_mock), \
+                     patch.object(mirror, '_remote_mk_dir', new=AsyncMock()), \
+                     patch.object(mirror, '_get_local_version', new=AsyncMock(return_value=local_version)), \
+                     patch.object(mirror, '_get_remote_versions_stack', new=AsyncMock(return_value=[local_version])), \
+                     patch.object(mirror, '_create_version', return_value=pushed_version), \
+                     patch.object(mirror, '_push', new=AsyncMock()) as push_mock, \
+                     patch.object(mirror, '_get_remote_map', new=AsyncMock(side_effect=AssertionError('full compare should be skipped'))), \
+                     patch.object(mirror, '_confirm', side_effect=[False]) as confirm_mock:
+                    asyncio.run(mirror.run())
+
+                push_mock.assert_awaited_once()
+                confirm_mock.assert_called_once_with('Restart docker container?', 'Restart container choice is required')
 
     def test_version_message_accepts_exactly_50_characters(self):
         message = 'x' * 50

@@ -10,6 +10,10 @@ remotedir: '/app'
 author: fellowx
 # Optional. If set, the container will be restarted after sync if you want. This is useful when the remote directory is mounted as a volume in a container and you want to apply changes immediately.
 restart_container:
+  # Optional. Restart a local container on the same machine where sshmirror runs.
+  # Do not combine with host/port/username or SSH auth fields.
+  # local: true
+
   # Optional. If omitted, values from the main connection are reused.
   # host: '192.168.12.22'
   # port: '23322'
@@ -20,6 +24,6 @@ restart_container:
   # private_key_passphrase: 'KeyPassphrase'
   # password: 'password'
   sudo: true
-  # Optional. Needed only when sudo requires a password and SSH auth uses a key.
+  # Optional. Needed only when sudo requires a password.
   # sudo_password: 'password'
   container_name: testcontainer

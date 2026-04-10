@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.19
+
+### Fixed
+
+- Restored the `restart_container` prompt after successful `push`, including fast-path syncs where the full post-push compare is skipped.
+
+### Added
+
+- Added `restart_container.local: true` to restart a Docker container on the same machine where `sshmirror` is running, without an extra SSH Docker host connection.
+
 ## 0.1.18
 
 ### Fixed

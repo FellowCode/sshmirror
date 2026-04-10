@@ -69,6 +69,19 @@ class SSHMirrorConfig:
         if 'user' in restart_container:
             raise ValueError("Config field 'restart_container.user' is no longer supported. Use 'restart_container.username'")
 
+        if 'local' in restart_container and not isinstance(restart_container.get('local'), bool):
+            raise ValueError("Config field 'restart_container.local' must be true or false")
+
+        if restart_container.get('local', False):
+            incompatible_connection_keys = [
+                key for key in ['host', 'port', 'username', 'password', 'private_key', 'private_key_passphrase', 'ssh_key', 'ssh_key_passphrase']
+                if restart_container.get(key) not in (None, '')
+            ]
+            if incompatible_connection_keys:
+                raise ValueError(
+                    "Config field 'restart_container.local' cannot be combined with SSH connection fields"
+                )
+
         username_value = restart_container.get('username')
         if username_value is not None:
             restart_container['username'] = self._require_non_empty_string(username_value, 'restart_container.username')
@@ -80,20 +93,21 @@ class SSHMirrorConfig:
             'restart_container.container_name',
         )
 
-        connection_keys = {'host', 'port', 'username'}
-        provided_connection_keys = {
-            key for key in connection_keys
-            if key in restart_container and restart_container.get(key) not in (None, '')
-        }
-        if provided_connection_keys and provided_connection_keys != connection_keys:
-            raise ValueError(
-                "If restart_container uses a separate Docker host, specify 'host', 'port', and 'username' together"
-            )
+        if not restart_container.get('local', False):
+            connection_keys = {'host', 'port', 'username'}
+            provided_connection_keys = {
+                key for key in connection_keys
+                if key in restart_container and restart_container.get(key) not in (None, '')
+            }
+            if provided_connection_keys and provided_connection_keys != connection_keys:
+                raise ValueError(
+                    "If restart_container uses a separate Docker host, specify 'host', 'port', and 'username' together"
+                )
 
-        if 'host' in restart_container and restart_container.get('host') not in (None, ''):
-            restart_container['host'] = self._require_non_empty_string(restart_container.get('host'), 'restart_container.host')
-        if 'port' in restart_container and restart_container.get('port') not in (None, ''):
-            restart_container['port'] = self._normalize_port(restart_container.get('port'), 'restart_container.port')
+            if 'host' in restart_container and restart_container.get('host') not in (None, ''):
+                restart_container['host'] = self._require_non_empty_string(restart_container.get('host'), 'restart_container.host')
+            if 'port' in restart_container and restart_container.get('port') not in (None, ''):
+                restart_container['port'] = self._normalize_port(restart_container.get('port'), 'restart_container.port')
 
         if 'sudo' in restart_container and not isinstance(restart_container.get('sudo'), bool):
             raise ValueError("Config field 'restart_container.sudo' must be true or false")
