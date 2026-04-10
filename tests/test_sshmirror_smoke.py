@@ -308,6 +308,83 @@ class SSHMirrorSmokeTests(unittest.TestCase):
                 self.assertIn('cp .sshmirror/migrations/', downgrade_script)
                 self.assertNotIn('/app/', downgrade_script)
 
+    def test_remote_downgrade_script_quotes_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app',
+                    )
+                )
+
+                origin = FileMap()
+                origin.add('changed file.txt', 'md5-old', size=3, mtime=1)
+                origin.add('deleted file.txt', 'md5-del', size=3, mtime=1)
+                origin.add_directory('deleted dir')
+
+                target = FileMap()
+                target.add('changed file.txt', 'md5-new', size=4, mtime=2)
+                target.add('created file.txt', 'md5-created', size=7, mtime=3)
+                target.add_directory('created dir')
+
+                migration = origin.migrate_to(target)
+                version = mirror._create_version(target)
+                conn = Mock(spec=SSHClientConnection)
+
+                with patch.object(mirror, '_remote_cp_files', AsyncMock()) as cp_mock, \
+                     patch.object(mirror, '_write_remote_text_file', AsyncMock()) as write_remote_text_file_mock, \
+                     patch.object(mirror, '_run_remote_checked', AsyncMock()):
+                    asyncio.run(mirror._remote_create_downgrade(conn, migration, version))
+
+                cp_mock.assert_awaited_once()
+
+                downgrade_call = next(
+                    call for call in write_remote_text_file_mock.await_args_list
+                    if call.args[1].endswith('/_downgrade.sh')
+                )
+                downgrade_script = downgrade_call.args[2]
+
+                self.assertIn("rm 'created file.txt'", downgrade_script)
+                self.assertIn("mkdir -p 'deleted dir'", downgrade_script)
+                self.assertIn("rm -r 'created dir'", downgrade_script)
+                self.assertIn("cp '.sshmirror/migrations/", downgrade_script)
+                self.assertIn("/downgrade/changed file.txt' 'changed file.txt'", downgrade_script)
+                self.assertIn("/downgrade/deleted file.txt' 'deleted file.txt'", downgrade_script)
+
+    def test_run_remote_script_from_project_root_quotes_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with working_directory(tmp_path):
+                mirror = SSHMirror(
+                    config=SSHMirrorConfig(
+                        host='127.0.0.1',
+                        port=22,
+                        username='root',
+                        localdir='.',
+                        remotedir='/app dir',
+                    )
+                )
+
+                conn = Mock(spec=SSHClientConnection)
+
+                with patch.object(mirror, '_run_remote_checked', AsyncMock()) as run_remote_checked_mock:
+                    asyncio.run(mirror._run_remote_script_from_project_root(
+                        conn,
+                        '.sshmirror/migrations/version dir/_downgrade.sh',
+                        'Failed to run downgrade script',
+                    ))
+
+                run_remote_checked_mock.assert_awaited_once_with(
+                    conn,
+                    "cd '/app dir' && sh '.sshmirror/migrations/version dir/_downgrade.sh'",
+                    'Failed to run downgrade script',
+                )
+
     def test_render_diff_detail_accepts_structured_detail(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
