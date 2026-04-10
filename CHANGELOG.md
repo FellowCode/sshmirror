@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.18
+
+### Fixed
+
+- Fixed a missing `uuid` import in the remote push path which caused `NameError` during metadata file creation.
+
 ## 0.1.17
 
 ### Fixed
