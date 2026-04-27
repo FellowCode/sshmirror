@@ -12,3 +12,7 @@ class VersionAlreadyExists(Exception):
 
 class IncompatibleVersionFormat(Exception):
     pass
+
+
+class RemoteSyncLockError(Exception):
+    pass

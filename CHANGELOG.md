@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.24
+
+### Changed
+
+- Displayed the current sshmirror version unobtrusively when starting the interactive CLI.
+- Reworked the Status view into a staged overview with structured local, remote, and live-diff panels.
+
+### Fixed
+
+- Stopped Ctrl+C in the interactive menu from surfacing a UserAbort error message.
+- Prevented concurrent client syncs with a remote lock file that blocks parallel runs and expires automatically after 5 minutes.
+- Returned interactive version history and compare lists to the same newest-first page after backing out of a version view.
+- Fully cleared push and pull preview tables after repeated invalid yes/no confirmation input.
+- Corrected force-pull/discard migration direction so local-only files are deleted and remote-only files are pulled from the server.
+
 ## 0.1.23
 
 ### Changed

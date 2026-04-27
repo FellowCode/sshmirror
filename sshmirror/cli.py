@@ -344,6 +344,21 @@ def _format_version_page_prompt(prompt: str, page: int, total_versions: int, pag
     return f'{prompt} (page {normalized_page + 1}/{total_pages}, showing {shown_from}-{shown_to} of {total_versions}, newest first)'
 
 
+def _get_version_page_for_index(
+    version_index: int,
+    *,
+    total_versions: int,
+    start_index: int = 0,
+    page_size: int = VERSION_PAGE_SIZE,
+) -> int:
+    if total_versions <= 0:
+        return 0
+
+    relative_index = max(0, min(version_index - start_index, total_versions - 1))
+    newest_first_offset = (total_versions - 1) - relative_index
+    return max(0, newest_first_offset // page_size)
+
+
 def _build_version_choice_map(page_versions: list[DiffVersionInfo]) -> OrderedDict[str, DiffVersionInfo]:
     return OrderedDict((_format_version_choice_label(version), version) for version in page_versions)
 
@@ -650,7 +665,7 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         if base_version.index is None:
             raise ValueError('Selected version is missing index information')
 
-        current_base_page = max(0, base_version.index // VERSION_PAGE_SIZE)
+        current_base_page = _get_version_page_for_index(base_version.index, total_versions=total_versions)
 
         if total_versions - (base_version.index + 1) <= 0:
             console.print('No later versions available for comparison', style='yellow')
@@ -673,7 +688,11 @@ async def _show_version_changes_cli(mirror: SSHMirror) -> None:
         if target_version.index is None:
             raise ValueError('Selected version is missing index information')
 
-        current_target_page = max(0, (target_version.index - (base_version.index + 1)) // VERSION_PAGE_SIZE)
+        current_target_page = _get_version_page_for_index(
+            target_version.index,
+            total_versions=total_versions - (base_version.index + 1),
+            start_index=base_version.index + 1,
+        )
         await _inspect_version_range_cli(mirror, base_version, target_version)
 
 
@@ -778,7 +797,7 @@ async def _show_version_history_cli(mirror: SSHMirror) -> None:
         if target_version.index is None:
             raise ValueError('Selected version is missing index information')
 
-        current_page = max(0, target_version.index // VERSION_PAGE_SIZE)
+        current_page = _get_version_page_for_index(target_version.index, total_versions=total_versions)
 
         if target_version.index <= 0:
             console.print('No previous version available for comparison', style='yellow')

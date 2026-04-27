@@ -14,6 +14,8 @@ import datetime
 import time
 import subprocess
 import uuid
+import contextlib
+import socket
 import aiofiles
 import pathlib
 import shutil
@@ -36,7 +38,8 @@ try:
     from .core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from .core.filewatcher import Filewatcher
     from .core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
-    from .core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, UserAbort, VersionAlreadyExists
+    from .core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, RemoteSyncLockError, UserAbort, VersionAlreadyExists
+    from .prompts import consume_confirm_retry_extra_lines
 except ImportError:
     from _version import __version__, DIR_VERSION_FORMAT
     from config import SSHMirrorCallbacks, SSHMirrorConfig
@@ -44,7 +47,8 @@ except ImportError:
     from core.filemap import FileEntry, FileMap, DirVersion, Migration, Conflicts
     from core.filewatcher import Filewatcher
     from core.utils import check_path_is_ignored, clear_n_console_rows, compile_ignore_rules, parse_ignore_file, read_text_file, write_text_file_atomic_async
-    from core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, UserAbort, VersionAlreadyExists
+    from core.exceptions import ErrorLocalVersion, IncompatibleVersionFormat, RemoteSyncLockError, UserAbort, VersionAlreadyExists
+    from prompts import consume_confirm_retry_extra_lines
 
 console = Console()
 
@@ -95,10 +99,13 @@ class SSHMirror:
     WARNING_SIZE = 10 * 1024 * 1024 # 100Mb
     DIFF_CONTEXT_LINES = 2
     VERSION_MESSAGE_MAX_LENGTH = 50
+    REMOTE_SYNC_LOCK_TTL_SECONDS = 5 * 60
+    REMOTE_SYNC_LOCK_REFRESH_SECONDS = 60
     versions_directory = '.sshmirror/versions'
     migrations_directory = '.sshmirror/migrations'
     conflicts_file = '.sshmirror/conflicts.json'
     prevstate_file = '.sshmirror/prevstate.json'
+    remote_sync_lock_file = '.sshmirror/sync.lock'
     filesize_ignore_file = 'sshmirror.ignoresize.txt'
     stash_directory = STASH_DIRECTORY
     stash_files_directory = STASH_FILES_DIRECTORY
@@ -206,6 +213,9 @@ class SSHMirror:
 
         self.filewatcher = Filewatcher(self.localdir, None)
         self._runtime_restart_sudo_password = None
+        self._remote_sync_lock_active = False
+        self._remote_sync_lock_heartbeat_task: asyncio.Task | None = None
+        self._last_confirm_retry_extra_lines = 0
 
         self._refresh_ignore_file_path()
 
@@ -366,7 +376,10 @@ class SSHMirror:
     def _confirm(self, message: str, abort_message: str) -> bool:
         if self.callbacks.confirm is None:
             raise UserAbort(abort_message)
-        return self.callbacks.confirm(message)
+        consume_confirm_retry_extra_lines()
+        result = self.callbacks.confirm(message)
+        self._last_confirm_retry_extra_lines = consume_confirm_retry_extra_lines()
+        return result
 
     def _choose(self, message: str, choices: list[str], abort_message: str) -> str:
         if self.callbacks.choose is None:
@@ -384,6 +397,175 @@ class SSHMirror:
             return result.stdout
         except Exception:
             return None
+
+    @staticmethod
+    def _parse_remote_sync_lock_metadata(lock_text: str | None) -> dict[str, typing.Any]:
+        if not lock_text:
+            return {}
+        try:
+            data = json.loads(lock_text)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _build_remote_sync_lock_message(
+        cls,
+        *,
+        metadata: dict[str, typing.Any] | None = None,
+        age_seconds: int | None = None,
+    ) -> str:
+        details: list[str] = []
+        metadata = metadata or {}
+        author = (metadata.get('author') or '').strip()
+        client_host = (metadata.get('client_host') or '').strip()
+        username = (metadata.get('username') or '').strip()
+        created_at = (metadata.get('created_at') or '').strip()
+
+        if author:
+            details.append(f'author={author}')
+        if username:
+            details.append(f'user={username}')
+        if client_host:
+            details.append(f'client={client_host}')
+        if created_at:
+            details.append(f'created_at={created_at}')
+        if age_seconds is not None and age_seconds >= 0:
+            details.append(f'age={max(1, int(age_seconds // 60))} min')
+
+        suffix = '' if not details else f' ({", ".join(details)})'
+        return (
+            'Another client is already synchronizing this project. '
+            f'Sync lock is active{suffix}. Retry later. '
+            'If that client lost connection, the lock expires automatically within 5 minutes.'
+        )
+
+    async def _get_remote_sync_lock_state(
+        self,
+        conn: typing.Any,
+    ) -> tuple[bool, int | None, dict[str, typing.Any]]:
+        remote_lock_path = self._remote_get_abs_path(self.remote_sync_lock_file)
+        stat_result = await conn.run(
+            f'stat -c %Y {shlex.quote(remote_lock_path)}',
+            check=False,
+        )
+        if stat_result.exit_status != 0 or stat_result.stdout.strip() == '':
+            return False, None, {}
+
+        try:
+            mtime_seconds = int(stat_result.stdout.strip())
+        except ValueError:
+            mtime_seconds = None
+
+        lock_text = await self._read_remote_text_file(conn, remote_lock_path)
+        return True, mtime_seconds, self._parse_remote_sync_lock_metadata(lock_text)
+
+    async def _cleanup_stale_remote_sync_lock(self, conn: typing.Any) -> bool:
+        exists, mtime_seconds, metadata = await self._get_remote_sync_lock_state(conn)
+        if not exists:
+            return False
+
+        now_seconds = int(time.time())
+        age_seconds = None if mtime_seconds is None else max(0, now_seconds - mtime_seconds)
+        if age_seconds is None or age_seconds < self.REMOTE_SYNC_LOCK_TTL_SECONDS:
+            return False
+
+        await conn.run(
+            f'rm -f {shlex.quote(self._remote_get_abs_path(self.remote_sync_lock_file))}',
+            check=False,
+        )
+        console.print(
+            'Removed stale sync lock older than 5 minutes'
+            + (
+                ''
+                if len(metadata) == 0
+                else f': {self._build_remote_sync_lock_message(metadata=metadata, age_seconds=age_seconds)}'
+            ),
+            style='yellow',
+        )
+        return True
+
+    def _build_remote_sync_lock_payload(self) -> str:
+        return json.dumps(
+            {
+                'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'author': self.author,
+                'username': self.username,
+                'client_host': socket.gethostname(),
+                'localdir': os.path.abspath(self.localdir or '.'),
+            },
+            indent=2,
+        )
+
+    async def _refresh_remote_sync_lock(self, conn: typing.Any) -> None:
+        remote_lock_path = self._remote_get_abs_path(self.remote_sync_lock_file)
+        while self._remote_sync_lock_active:
+            await asyncio.sleep(self.REMOTE_SYNC_LOCK_REFRESH_SECONDS)
+            if not self._remote_sync_lock_active:
+                return
+            await conn.run(f'touch {shlex.quote(remote_lock_path)}', check=False)
+
+    async def _acquire_remote_sync_lock(self, conn: typing.Any) -> None:
+        if self._remote_sync_lock_active:
+            return
+
+        await self._run_remote_checked(
+            conn,
+            f'mkdir -p {shlex.quote(self._remote_get_abs_path(".sshmirror"))}',
+            'Failed to prepare remote sync lock directory',
+        )
+
+        await self._cleanup_stale_remote_sync_lock(conn)
+
+        remote_lock_path = self._remote_get_abs_path(self.remote_sync_lock_file)
+        create_result = await conn.run(
+            f"sh -c 'umask 077; set -C; : > \"$1\"' sh {shlex.quote(remote_lock_path)}",
+            check=False,
+        )
+        if create_result.exit_status != 0:
+            exists, mtime_seconds, metadata = await self._get_remote_sync_lock_state(conn)
+            age_seconds = None if mtime_seconds is None else max(0, int(time.time()) - mtime_seconds)
+            if exists and age_seconds is not None and age_seconds >= self.REMOTE_SYNC_LOCK_TTL_SECONDS:
+                await self._cleanup_stale_remote_sync_lock(conn)
+                create_result = await conn.run(
+                    f"sh -c 'umask 077; set -C; : > \"$1\"' sh {shlex.quote(remote_lock_path)}",
+                    check=False,
+                )
+            if create_result.exit_status != 0:
+                raise RemoteSyncLockError(
+                    self._build_remote_sync_lock_message(metadata=metadata, age_seconds=age_seconds)
+                )
+
+        await self._write_remote_text_file(conn, self.remote_sync_lock_file, self._build_remote_sync_lock_payload())
+        self._remote_sync_lock_active = True
+        self._remote_sync_lock_heartbeat_task = asyncio.create_task(self._refresh_remote_sync_lock(conn))
+
+    async def _release_remote_sync_lock(self, conn: typing.Any) -> None:
+        heartbeat_task = self._remote_sync_lock_heartbeat_task
+        self._remote_sync_lock_heartbeat_task = None
+        self._remote_sync_lock_active = False
+
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+        try:
+            await conn.run(
+                f'rm -f {shlex.quote(self._remote_get_abs_path(self.remote_sync_lock_file))}',
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def _build_before_sync_lock_callback(
+        self,
+        conn: typing.Any,
+    ) -> Callable[[], typing.Awaitable[None]]:
+        async def ensure_remote_sync_lock() -> None:
+            await self._acquire_remote_sync_lock(conn)
+
+        return ensure_remote_sync_lock
 
     async def _get_remote_migration_changes_cached(
         self,
@@ -849,6 +1031,8 @@ class SSHMirror:
         remote_versions: list[DirVersion],
         live_diff: Migration,
         local_version_missing_remote: bool = False,
+        remote_snapshot_matches: bool | None = None,
+        remote_snapshot_migration: Migration | None = None,
     ) -> Panel:
         table = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=True, pad_edge=False)
         table.add_column('Item', style='dim', width=22, no_wrap=True)
@@ -898,6 +1082,15 @@ class SSHMirror:
             )
         table.add_row('Remote history', remote_history_text)
 
+        if remote_snapshot_matches is None:
+            snapshot_text = Text('no remote snapshot available', style='dim')
+        else:
+            snapshot_text = Text(
+                'matches latest remote version' if remote_snapshot_matches else f'drift detected: {self._format_migration_summary(remote_snapshot_migration)}',
+                style='green bold' if remote_snapshot_matches else 'yellow',
+            )
+        table.add_row('Remote snapshot', snapshot_text)
+
         live_state_text = Text(
             'projects are equal' if live_diff.empty() else f'drift detected: {self._format_migration_summary(live_diff)}',
             style='green bold' if live_diff.empty() else 'yellow',
@@ -927,6 +1120,7 @@ class SSHMirror:
         title: str,
         subtitle: str,
         border_style: str = 'yellow',
+        remote_verify_reference: bool = False,
     ) -> tuple[FileMap, FileMap]:
         started_at = time.monotonic()
         steps = [
@@ -934,7 +1128,7 @@ class SSHMirror:
             {'label': 'Scan remote project', 'status': 'running'},
         ]
         local_task = asyncio.create_task(self.filewatcher.get_filemap(reference_map=local_reference_map))
-        remote_task = asyncio.create_task(self._get_remote_map(conn, reference_map=remote_reference_map))
+        remote_task = asyncio.create_task(self._get_remote_map(conn, reference_map=remote_reference_map, verify_reference=remote_verify_reference))
         task_indexes = {
             local_task: 0,
             remote_task: 1,
@@ -1988,7 +2182,14 @@ class SSHMirror:
                 title='Status',
                 subtitle='Scanning local and remote project state for the status overview.',
                 border_style='green',
+                remote_verify_reference=len(remote_versions) > 0,
             )
+
+        remote_snapshot_migration = None
+        remote_snapshot_matches = None
+        if len(remote_versions) > 0:
+            remote_snapshot_migration = remote_versions[-1].filemap.migrate_to(remote_map)
+            remote_snapshot_matches = remote_snapshot_migration.empty()
 
         live_diff = local_state.migrate_to(remote_map)
         console.print(self._render_status_overview(
@@ -2000,6 +2201,8 @@ class SSHMirror:
             remote_versions=remote_versions,
             live_diff=live_diff,
             local_version_missing_remote=local_version_missing_remote,
+            remote_snapshot_matches=remote_snapshot_matches,
+            remote_snapshot_migration=remote_snapshot_migration,
         ))
 
         if prevstate is None:
@@ -2061,161 +2264,179 @@ class SSHMirror:
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
-            clear_n_console_rows(1)
-            
-            
-            if self.discard_files is not None:
-                await self._download_files(conn, self.discard_files, '  remote > update', style='violet')
-                return
-            
-            console.print('Check exists no resolved conflicts...', style='yellow')
-            if not await self._validate_conflicts():
-                return 
-            clear_n_console_rows(1)
+            before_sync = self._build_before_sync_lock_callback(conn)
+            try:
+                clear_n_console_rows(1)
 
-            await self._sync_ignore_file_before_transfer(conn)
-            
-            console.print('Look local changes...', style='yellow')
-            prevstate = await self._load_or_create_prevstate()
-            state, _ = await asyncio.gather(
-                self.filewatcher.get_filemap(reference_map=prevstate),
-                self._remote_mk_dir(conn, self.versions_directory),
-            )
-            
-            local_migration = prevstate.migrate_to(state)
-            clear_n_console_rows(1)
-            
-            if self.downgrade:
-                if not local_migration.empty():
-                    console.print('Before downgrade push or discard changes!', style='red')
+                if self.discard_files is not None:
+                    await self._download_files(conn, self.discard_files, '  remote > update', style='violet')
                     return
-                versions = await self._get_remote_versions_stack(conn, last_n=2)
-                if len(versions) < 2:
-                    console.print('Downgrade requires at least two remote versions', style='yellow')
+
+                console.print('Check exists no resolved conflicts...', style='yellow')
+                if not await self._validate_conflicts():
                     return
-                migration_changes = await self._get_remote_migration_changes(conn, versions[-1])
-                await self._downgrade_remote(conn, versions[-1], versions[-2], migration_changes.inversed())
-                return
-            
-            # Check file sizes
-            large_files = []
-            for path in state.path_list():
-                size = os.path.getsize(path)
-                if size > self.WARNING_SIZE:
-                    large_files.append(path)
-                    
-            if os.path.exists(self.filesize_ignore_file):
-                sizeignores = set(map(lambda x: x.strip(), read_text_file(self.filesize_ignore_file).splitlines()))
-                large_files = list(set(large_files).difference(sizeignores))
-            
-            # Large files
-            if len(large_files) > 0:
-                for path in large_files:
-                    size_mb = int(os.path.getsize(path) / 1024 / 1024)
-                    console.print(f'WARNING! Large file size={size_mb}Mb path="{path}"', style='yellow')
-                    
-                if not self._confirm(
-                    'Add large files to ignore size list?',
-                    'Large files were not added to sshmirror.ignoresize.txt',
-                ):
-                    console.print('Add this files to sshmirror.ignore.txt and try again', style='yellow')
-                    raise UserAbort('Large files were not added to sshmirror.ignoresize.txt')
-                
-                with open(self.filesize_ignore_file, 'a') as f:
-                    f.write('\n'.join(large_files) + '\n')
-            
-            console.print('Look remote changes...', style='yellow')
-            while True:
-                try:
-                    local_version = await self._get_local_version()    
-                    remote_versions = await self._get_remote_versions_stack(conn, start_version=local_version)
-                    break
-                except ErrorLocalVersion:
-                    os.remove(os.path.join(self.versions_directory, local_version.filename()))
-            clear_n_console_rows(1)
-            
-            if local_version is None:
-                remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else None
-                remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
-                newer_source = self._choose(
-                    'Which version is newer?',
-                    ['My local version', 'Remote server version'],
-                    'Initialization source is required',
+                clear_n_console_rows(1)
+
+                await self._sync_ignore_file_before_transfer(conn)
+
+                console.print('Look local changes...', style='yellow')
+                prevstate = await self._load_or_create_prevstate()
+                state, _ = await asyncio.gather(
+                    self.filewatcher.get_filemap(reference_map=prevstate),
+                    self._remote_mk_dir(conn, self.versions_directory),
                 )
-                if newer_source == 'Remote server version':
-                    migration = state.migrate_to(remote_map)
-                    if len(remote_versions) == 0:
-                        remote_version = self._create_version(remote_map)
-                        await self._set_remote_version(remote_version, conn)
-                        remote_versions = [remote_version]
-                    empty_conflicts = Conflicts(remote_version_uid=remote_versions[-1].uid, files=[], dirs=[])
-                    await self._pull(remote_versions, migration, empty_conflicts, conn)
-                else:
-                    migration = remote_map.migrate_to(state)
-                    version = self._create_version(state)
-                    await self._push(version, migration, conn)
-                await self._maybe_restart_container()
-                return
 
-            pushed_version: DirVersion | None = None
-            
-            if len(remote_versions) > 1:
-                # Remote changed by other contributer
-                remote_migration = remote_versions[0].filemap.migrate_to(remote_versions[-1].filemap)
-                
-                if not remote_migration.empty():
-                    conflicts = remote_migration.conflicts(remote_versions[-1], local_migration)
-                    await self._pull(remote_versions[1:], remote_migration, conflicts, conn)
-                    if not conflicts.empty():
+                local_migration = prevstate.migrate_to(state)
+                clear_n_console_rows(1)
+
+                if self.downgrade:
+                    if not local_migration.empty():
+                        console.print('Before downgrade push or discard changes!', style='red')
                         return
-                    prevstate = await self._load_or_create_prevstate()
-                    state = await self.filewatcher.get_filemap(reference_map=prevstate)
-                    local_migration = prevstate.migrate_to(state)
+                    versions = await self._get_remote_versions_stack(conn, last_n=2)
+                    if len(versions) < 2:
+                        console.print('Downgrade requires at least two remote versions', style='yellow')
+                        return
+                    migration_changes = await self._get_remote_migration_changes(conn, versions[-1])
+                    await self._downgrade_remote(
+                        conn,
+                        versions[-1],
+                        versions[-2],
+                        migration_changes.inversed(),
+                        before_sync=before_sync,
+                    )
+                    return
 
-            if not self.pull_only and not local_migration.empty():
-                # Push changes
-                version = self._create_version(state)
-                if len(remote_versions) > 0 and version.dt <= remote_versions[-1].dt:
-                    raise ValueError(f'Push version timestamp less than last version timestamp on remote ({version.dt} < {remote_versions[-1].dt})')
-                await self._push(version, local_migration, conn)
-                pushed_version = version
-                local_version = version
-                remote_versions = [version]
+                large_files = []
+                for path in state.path_list():
+                    size = os.path.getsize(path)
+                    if size > self.WARNING_SIZE:
+                        large_files.append(path)
 
-            if pushed_version is not None and not self._has_sync_commands():
-                console.print('Skip full remote/local verification after push: sync state is already known', style='dim')
-                console.print('Projects are equal', style='green')
-                await self._maybe_restart_container()
-                return
+                if os.path.exists(self.filesize_ignore_file):
+                    sizeignores = set(map(lambda x: x.strip(), read_text_file(self.filesize_ignore_file).splitlines()))
+                    large_files = list(set(large_files).difference(sizeignores))
 
-            console.print('Compare remote and local projects...', style='yellow')
-            remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
-            local_map, remote_map = await self._scan_project_maps_with_progress(
-                conn,
-                local_reference_map=state,
-                remote_reference_map=remote_reference,
-                title='Full Project Verification',
-                subtitle='Scanning local and remote projects to confirm they are fully synchronized.',
-            )
-            migration = local_map.migrate_to(remote_map)
-            clear_n_console_rows(1)
-            
-            if not migration.empty():
-                console.print('Remote and local projects has differences!!!', style='red')
-                migration.print()
-                empty_conflicts = Conflicts(remote_version_uid=remote_versions[-1].uid, files=[], dirs=[])
+                if len(large_files) > 0:
+                    for path in large_files:
+                        size_mb = int(os.path.getsize(path) / 1024 / 1024)
+                        console.print(f'WARNING! Large file size={size_mb}Mb path="{path}"', style='yellow')
 
-                sync_action = self._choose(
-                    'Projects differ after sync. Choose resolution.',
-                    ['Pull', 'Push'],
-                    'Sync resolution is required',
+                    if not self._confirm(
+                        'Add large files to ignore size list?',
+                        'Large files were not added to sshmirror.ignoresize.txt',
+                    ):
+                        console.print('Add this files to sshmirror.ignore.txt and try again', style='yellow')
+                        raise UserAbort('Large files were not added to sshmirror.ignoresize.txt')
+
+                    with open(self.filesize_ignore_file, 'a') as f:
+                        f.write('\n'.join(large_files) + '\n')
+
+                console.print('Look remote changes...', style='yellow')
+                while True:
+                    try:
+                        local_version = await self._get_local_version()
+                        remote_versions = await self._get_remote_versions_stack(conn, start_version=local_version)
+                        break
+                    except ErrorLocalVersion:
+                        os.remove(os.path.join(self.versions_directory, local_version.filename()))
+                clear_n_console_rows(1)
+
+                if local_version is None:
+                    remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else None
+                    remote_map = await self._get_remote_map(conn, reference_map=remote_reference)
+                    newer_source = self._choose(
+                        'Which version is newer?',
+                        ['My local version', 'Remote server version'],
+                        'Initialization source is required',
+                    )
+                    if newer_source == 'Remote server version':
+                        migration = state.migrate_to(remote_map)
+                        if len(remote_versions) == 0:
+                            await before_sync()
+                            remote_version = self._create_version(remote_map)
+                            await self._set_remote_version(remote_version, conn)
+                            remote_versions = [remote_version]
+                        empty_conflicts = Conflicts(remote_version_uid=remote_versions[-1].uid, files=[], dirs=[])
+                        await self._pull(remote_versions, migration, empty_conflicts, conn, before_sync=before_sync)
+                    else:
+                        migration = remote_map.migrate_to(state)
+                        version = self._create_version(state)
+                        await self._push(version, migration, conn, before_sync=before_sync)
+                    await self._maybe_restart_container()
+                    return
+
+                pushed_version: DirVersion | None = None
+
+                if len(remote_versions) > 1:
+                    remote_migration = remote_versions[0].filemap.migrate_to(remote_versions[-1].filemap)
+
+                    if not remote_migration.empty():
+                        conflicts = remote_migration.conflicts(remote_versions[-1], local_migration)
+                        await self._pull(remote_versions[1:], remote_migration, conflicts, conn, before_sync=before_sync)
+                        if not conflicts.empty():
+                            return
+                        prevstate = await self._load_or_create_prevstate()
+                        state = await self.filewatcher.get_filemap(reference_map=prevstate)
+                        local_migration = prevstate.migrate_to(state)
+
+                if not self.pull_only and not local_migration.empty():
+                    version = self._create_version(state)
+                    if len(remote_versions) > 0 and version.dt <= remote_versions[-1].dt:
+                        raise ValueError(f'Push version timestamp less than last version timestamp on remote ({version.dt} < {remote_versions[-1].dt})')
+                    await self._push(version, local_migration, conn, before_sync=before_sync)
+                    pushed_version = version
+                    local_version = version
+                    remote_versions = [version]
+
+                if pushed_version is not None and not self._has_sync_commands():
+                    console.print('Skip full remote/local verification after push: sync state is already known', style='dim')
+                    console.print('Projects are equal', style='green')
+                    await self._maybe_restart_container()
+                    return
+
+                console.print('Compare remote and local projects...', style='yellow')
+                remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else local_version.filemap if local_version else None
+                local_map, remote_map = await self._scan_project_maps_with_progress(
+                    conn,
+                    local_reference_map=state,
+                    remote_reference_map=remote_reference,
+                    title='Full Project Verification',
+                    subtitle='Scanning local and remote projects to confirm they are fully synchronized.',
                 )
-                if sync_action == 'Push':
-                    await self._push(self._create_version(local_map), remote_map.migrate_to(local_map), conn)
-                else:
-                    await self._pull(remote_versions, migration, empty_conflicts, conn, ignore_version_exists=True)
-                
-            console.print('Projects are equal', style='green')
+                migration = local_map.migrate_to(remote_map)
+                clear_n_console_rows(1)
+
+                if not migration.empty():
+                    console.print('Remote and local projects has differences!!!', style='red')
+                    migration.print()
+                    empty_conflicts = Conflicts(remote_version_uid=remote_versions[-1].uid, files=[], dirs=[])
+
+                    sync_action = self._choose(
+                        'Projects differ after sync. Choose resolution.',
+                        ['Pull', 'Push'],
+                        'Sync resolution is required',
+                    )
+                    if sync_action == 'Push':
+                        await self._push(
+                            self._create_version(local_map),
+                            remote_map.migrate_to(local_map),
+                            conn,
+                            before_sync=before_sync,
+                        )
+                    else:
+                        await self._pull(
+                            remote_versions,
+                            migration,
+                            empty_conflicts,
+                            conn,
+                            ignore_version_exists=True,
+                            before_sync=before_sync,
+                        )
+
+                console.print('Projects are equal', style='green')
+            finally:
+                await self._release_remote_sync_lock(conn)
             
         await self._maybe_restart_container()
                     
@@ -2237,36 +2458,48 @@ class SSHMirror:
             username=self.username,
             auth_kwargs=self.auth_kwargs,
         )) as conn:
-            await self._sync_ignore_file_before_transfer(conn)
-            clear_n_console_rows(1)
-            console.print('Get local and remote versions...', style='yellow')
-            local_versions, remote_versions = await asyncio.gather(self._get_local_versions_stack(), self._get_remote_versions_stack(conn))
-            remote_versions_set = {rv.filename() for rv in remote_versions}
-            clear_n_console_rows(1)
-            console.print('Get local and remote states...', style='yellow')
-            prevstate = await self._load_prevstate()
-            remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else None
-            local_map, remote_map = await self._scan_project_maps_with_progress(
-                conn,
-                local_reference_map=prevstate,
-                remote_reference_map=remote_reference,
-                title='Force Pull',
-                subtitle='Scanning local and remote projects before overwriting local state.',
-            )
-            clear_n_console_rows(1)
-            console.print('Remove local versions...', style='yellow')
-            count = 0
-            for local_version in local_versions:
-                if local_version.filename() not in remote_versions_set:
-                    os.remove(os.path.join(self.versions_directory, local_version.filename()))
-                    count += 1
-            clear_n_console_rows(1)
-            if count > 0:
-                console.print(f'Removed {count} versions', style='yellow')
-            
-            migration = remote_map.migrate_to(local_map)
-            await self._pull(remote_versions, migration, None, conn, ignore_version_exists=True, require_confirm=require_confirm)
-            await self._save_prevstate(remote_map)
+            before_sync = self._build_before_sync_lock_callback(conn)
+            try:
+                await self._sync_ignore_file_before_transfer(conn)
+                clear_n_console_rows(1)
+                console.print('Get local and remote versions...', style='yellow')
+                local_versions, remote_versions = await asyncio.gather(self._get_local_versions_stack(), self._get_remote_versions_stack(conn))
+                remote_versions_set = {rv.filename() for rv in remote_versions}
+                clear_n_console_rows(1)
+                console.print('Get local and remote states...', style='yellow')
+                prevstate = await self._load_prevstate()
+                remote_reference = remote_versions[-1].filemap if len(remote_versions) > 0 else None
+                local_map, remote_map = await self._scan_project_maps_with_progress(
+                    conn,
+                    local_reference_map=prevstate,
+                    remote_reference_map=remote_reference,
+                    title='Force Pull',
+                    subtitle='Scanning local and remote projects before overwriting local state.',
+                )
+                clear_n_console_rows(1)
+                console.print('Remove local versions...', style='yellow')
+                count = 0
+                for local_version in local_versions:
+                    if local_version.filename() not in remote_versions_set:
+                        os.remove(os.path.join(self.versions_directory, local_version.filename()))
+                        count += 1
+                clear_n_console_rows(1)
+                if count > 0:
+                    console.print(f'Removed {count} versions', style='yellow')
+
+                migration = local_map.migrate_to(remote_map)
+                await self._pull(
+                    remote_versions,
+                    migration,
+                    None,
+                    conn,
+                    ignore_version_exists=True,
+                    require_confirm=require_confirm,
+                    before_sync=before_sync,
+                )
+                await self._save_prevstate(remote_map)
+            finally:
+                await self._release_remote_sync_lock(conn)
             
     
     async def _load_conflicts(self) -> typing.Optional[Conflicts]:
@@ -2321,7 +2554,8 @@ class SSHMirror:
         return True
 
     async def _pull(self, remote_versions: list[DirVersion], migration: Migration, conflicts: Conflicts | None, conn: SSHClientConnection,
-                    ignore_version_exists=False, require_confirm: bool = True):
+                    ignore_version_exists=False, require_confirm: bool = True,
+                    before_sync: Callable[[], typing.Awaitable[None]] | None = None):
         title = 'Pull'
         subtitle = 'These changes will be applied to the local project.'
         border_style = 'green'
@@ -2339,7 +2573,7 @@ class SSHMirror:
             console.print(preview_panel)
             if not self._confirm('Apply pull changes? (Remote -> Local)', 'Pull cancelled by user'):
                 raise UserAbort('Pull cancelled by user')
-            clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
+            clear_n_console_rows(1 + self._last_confirm_retry_extra_lines)
 
         with Live(
             preview_panel,
@@ -2401,6 +2635,7 @@ class SSHMirror:
         current_version: DirVersion,
         target_version: DirVersion,
         migration_changes: MigrationChanges,
+        before_sync: Callable[[], typing.Awaitable[None]] | None = None,
     ) -> None:
         title = 'Downgrade'
         subtitle = f'These changes will revert the remote project to {target_version.uid[:8]}.'
@@ -2421,7 +2656,10 @@ class SSHMirror:
             'Downgrade cancelled by user',
         ):
             raise UserAbort('Downgrade cancelled by user')
-        clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
+        clear_n_console_rows(1 + self._last_confirm_retry_extra_lines)
+
+        if before_sync is not None:
+            await before_sync()
 
         all_paths = migration_changes.directories.all() + migration_changes.files.all()
         with Live(preview_panel, console=console, refresh_per_second=8) as live:
@@ -2473,7 +2711,13 @@ class SSHMirror:
         await self.force_pull(require_confirm=False)
         await self._maybe_restart_container()
         
-    async def _push(self, local_version: DirVersion, migration: Migration, conn: SSHClientConnection):
+    async def _push(
+        self,
+        local_version: DirVersion,
+        migration: Migration,
+        conn: SSHClientConnection,
+        before_sync: Callable[[], typing.Awaitable[None]] | None = None,
+    ):
         title = 'Push'
         subtitle = 'These changes will be applied to the remote project.'
         border_style = 'cyan'
@@ -2489,8 +2733,11 @@ class SSHMirror:
         console.print(preview_panel)
         if not self._confirm('Apply push changes? (Local -> Remote)', 'Push cancelled by user'):
             raise UserAbort('Push cancelled by user')
-        clear_n_console_rows(self._get_renderable_line_count(preview_panel) + 1)
+        clear_n_console_rows(1 + self._last_confirm_retry_extra_lines)
         local_version.message = self._prompt_version_message()
+
+        if before_sync is not None:
+            await before_sync()
 
         with Live(
             preview_panel,
@@ -2809,7 +3056,7 @@ class SSHMirror:
         pairs = await asyncio.gather(*[calculate(path) for path in paths])
         return {path: md5 for path, md5 in pairs}
 
-    async def _get_remote_map(self, conn: SSHClientConnection, reference_map: FileMap | None = None) -> FileMap:
+    async def _get_remote_map(self, conn: SSHClientConnection, reference_map: FileMap | None = None, verify_reference: bool = False) -> FileMap:
         ignore_list = compile_ignore_rules(parse_ignore_file(self.ignore_file_path))
         cmd_files, cmd_dirs = self._build_remote_find_commands(ignore_list)
         result_files, result_dirs = await asyncio.gather(conn.run(cmd_files), conn.run(cmd_dirs))
@@ -2829,6 +3076,10 @@ class SSHMirror:
             normalized_mtime = self._normalize_remote_mtime(mtime)
             reference_entry = reference_map.get_file(path) if reference_map is not None else None
             if reference_entry is not None and reference_entry.stat_matches(normalized_size, normalized_mtime):
+                if verify_reference:
+                    pending_hash_paths.append(path)
+                    pending_stats[path] = (normalized_size, normalized_mtime)
+                    continue
                 filemap.add(path, reference_entry.md5, size=normalized_size, mtime=normalized_mtime)
                 continue
             pending_hash_paths.append(path)

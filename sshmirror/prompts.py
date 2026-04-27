@@ -18,6 +18,7 @@ except Exception:
 
 console = Console()
 _PROMPT_FALLBACK = object()
+_LAST_CONFIRM_RETRY_EXTRA_LINES = 0
 _RU_TO_EN_KEYBOARD = str.maketrans({
     'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
     'х': '[', 'ъ': ']', 'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k',
@@ -25,6 +26,18 @@ _RU_TO_EN_KEYBOARD = str.maketrans({
     'б': ',', 'ю': '.',
 })
 _EN_TO_RU_KEYBOARD = str.maketrans({value: key for key, value in _RU_TO_EN_KEYBOARD.items()})
+
+
+def _set_last_confirm_retry_extra_lines(extra_lines: int) -> None:
+    global _LAST_CONFIRM_RETRY_EXTRA_LINES
+    _LAST_CONFIRM_RETRY_EXTRA_LINES = max(0, extra_lines)
+
+
+def consume_confirm_retry_extra_lines() -> int:
+    global _LAST_CONFIRM_RETRY_EXTRA_LINES
+    extra_lines = _LAST_CONFIRM_RETRY_EXTRA_LINES
+    _LAST_CONFIRM_RETRY_EXTRA_LINES = 0
+    return extra_lines
 
 
 def _questionary_available() -> bool:
@@ -121,11 +134,14 @@ def _fallback_choice_prompt(prompt: str, choices: list[str], default: str | None
         console.print('Invalid choice, try again', style='yellow')
 
 
-def _fallback_confirm_prompt(prompt: str) -> bool:
+def _fallback_confirm_prompt(prompt: str, *, initial_extra_lines: int = 0) -> bool:
+    extra_lines = initial_extra_lines
     while True:
         value = _normalize_confirm_value(_read_plain_input(f'{prompt} (yes/no): '))
         if value is not None:
+            _set_last_confirm_retry_extra_lines(extra_lines)
             return value
+        extra_lines += 2
         console.print('Please answer yes or no', style='yellow')
 
 
@@ -147,17 +163,20 @@ def prompt_choice(prompt: str, choices: list[str], default: str | None = None, s
 
 
 def prompt_confirm(prompt: str) -> bool:
+    extra_lines = 0
     while True:
         result = _questionary_ask(
             lambda: questionary.text(f'{prompt} (yes/no)'),
             'Interactive questionary confirm is unavailable, fallback to plain input',
         )
         if result is _PROMPT_FALLBACK:
-            return _fallback_confirm_prompt(prompt)
+            return _fallback_confirm_prompt(prompt, initial_extra_lines=extra_lines)
 
         normalized = _normalize_confirm_value(result)
         if normalized is not None:
+            _set_last_confirm_retry_extra_lines(extra_lines)
             return normalized
+        extra_lines += 2
         console.print('Please answer yes or no', style='yellow')
 
 
